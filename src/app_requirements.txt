@@ -1,0 +1,12 @@
+streamlit
+pandas
+openpyxl
+python-docx
+python-pptx
+vertexai
+google-cloud-aiplatform
+numpy==1.26.4
+pydantic
+PyMuPDF>=1.23.0
+google-generativeai
+databricks-sdk
