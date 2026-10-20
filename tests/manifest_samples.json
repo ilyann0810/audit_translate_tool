@@ -1,0 +1,21 @@
+{
+  "input_dir": "samples",
+  "documents": [
+    {
+      "file": "synthetique_de.xlsx",
+      "direction": "Allemand ➔ Français"
+    },
+    {
+      "file": "synthetique_de_excel.xlsx",
+      "direction": "Allemand ➔ Français"
+    },
+    {
+      "file": "synthetique_fr_mixte.pptx",
+      "direction": "Français ➔ Allemand"
+    },
+    {
+      "file": "synthetique_de.docx",
+      "direction": "Allemand ➔ Français"
+    }
+  ]
+}

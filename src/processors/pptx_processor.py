@@ -1,721 +1,1038 @@
+"""
+Traduction PPTX en gardant la forme et le style.
+
+Principes :
+  - on ne touche qu'au texte : cadres, marges, ancrage, interligne, puces,
+    couleurs et polices restent ceux de l'original ;
+  - chaque paragraphe est envoye au modele sous forme balisee (voir
+    core/segments.py) et chaque morceau traduit recoit une COPIE INTEGRALE
+    du style du run d'origine (couleur de theme, surlignage, police...) ;
+  - les champs (numero de diapositive, date) et autres objets restent en
+    place ;
+  - avant d'ecrire, on mesure la place que prend la traduction dans son
+    cadre et on la compare a l'original mesure de la meme facon. Si elle
+    ne tient plus : la forme s'agrandit si elle est en ajustement auto et
+    qu'il y a de la place, sinon on demande au modele une version plus
+    courte, puis on reduit la taille du texte juste ce qu'il faut ;
+  - sont traduits : diapositives (formes, groupes, tableaux), notes,
+    masques et dispositions, graphiques (titres, series, categories) et
+    SmartArt.
+"""
+import copy
+import math
 import os
-import shutil
-import json
 import re
+import shutil
+import tempfile
 import time
+
+from lxml import etree
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.text import MSO_ANCHOR
-from pptx.util import Pt
-from pptx.oxml import parse_xml
-from pptx.oxml.ns import nsdecls, qn
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 
-# Imports de l'architecture centrale
-from core.translation_api import call_gemini_batch, call_gemini_fallback, build_prompt
-from core.text_utils import load_glossary_df, get_matching_glossary_rules
+from core.segments import Segment
+from core.text_fit import Para, Run, get_font, layout
+from core.text_utils import load_glossary_df
+from core.translation_api import (LANG, PRICE_IN, PRICE_OUT, items_to_tagged,
+                                  shorten_segments, translate_segments)
 
-def check_manual_override(orig_txt):
-    """Détecte souplement la phrase allemande pour imposer le texte court du Comex."""
-    clean = re.sub(r'<[^>]+>', '', orig_txt).lower()
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    if "verteilung" in clean and "prüfungsergebnisse" in clean:
-        return "Le rapport d'audit sera également envoyé aux membres du Comex"
-    return None
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+A = "{%s}" % A_NS
+P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+C = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+EMU_PER_PT = 12700
 
-def is_untranslatable_text(clean_text: str) -> bool:
-    """Détecte si un texte est composé uniquement de chiffres, dates ou symboles."""
-    cleaned = clean_text.strip()
-    if not cleaned:
-        return True
-    return not bool(re.search(r'[a-zA-ZÀ-ÿ]', cleaned))
+LOCALE = {"fr": "fr-FR", "de": "de-DE"}
 
-def is_already_in_target_language(clean_text: str, direction: str) -> bool:
-    """
-    Évite d'inverser des titres 100% déjà dans la langue cible,
-    tout en envoyant à la traduction les titres hybrides contenant du français.
-    """
-    t_lower = clean_text.lower()
-    if direction == "Français ➔ Allemand":
-        # Marqueurs français signalant qu'il reste du texte à traduire
-        french_indicators = [
-            r'\b(avec|sans|pour|dans|sur|par|marge|négative|pertes|magasin|semaine|hebdo|hebdomadaire|'
-            r'chiffres|clés|non\s+conforme|du|des|de|le|la|les|un|une|et|en|selon|nouveau|ventilation|'
-            r'poisson|sec|fruits|légumes|frais|surgelés|viandes|boissons|attention|prochaines)\b'
-        ]
-        if any(re.search(pat, t_lower) for pat in french_indicators):
-            return False  # Contient du français : doit obligatoirement être traduit
+# Reduction de la taille du texte : en dessous de SHORTEN_BELOW on demande
+# d'abord une formulation plus courte ; MIN_SCALE est le plancher.
+SHORTEN_BELOW = 0.85
+MIN_SCALE = 0.6
+SCALE_STEP = 0.025
 
-        german_markers = [
-            "wochenkennzahlen", "wochenperformance", "abschriften",
-            "kassenausgang", "eingangskoffer", "sammelstelle"
-        ]
-        if any(m in t_lower for m in german_markers):
-            return True  # 100% allemand : conservé tel quel
+# Attributs de run sans effet visuel : ignores pour regrouper les runs.
+_NEUTRAL_RPR_ATTRS = {"lang", "altLang", "dirty", "err", "noProof", "smtClean", "smtId", "bmk"}
 
-    elif direction == "Allemand ➔ Français":
-        german_indicators = [
-            r'\b(und|oder|mit|ohne|für|in|an|auf|aus|bei|nach|von|zu|vor|über|unter|nicht|konform|'
-            r'filiale|filialen|geschäft|kunden|einkauf|supermärkte|überblick|wochenperformance|'
-            r'abschriften|verwertung|gesamt|trockensortiment|frische|warengruppe)\b'
-        ]
-        if any(re.search(pat, t_lower) for pat in german_indicators):
+_TITLE_TYPES = {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.VERTICAL_TITLE}
+_OTHER_TYPES = {PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER,
+                PP_PLACEHOLDER.HEADER}
+
+
+# --------------------------------------------------------------------------
+# Segments : paragraphe DrawingML <-> texte balise
+# --------------------------------------------------------------------------
+
+def _style_key(rpr):
+    if rpr is None:
+        return "-"
+    el = copy.deepcopy(rpr)
+    for a in list(el.attrib):
+        if a in _NEUTRAL_RPR_ATTRS:
+            del el.attrib[a]
+    return etree.tostring(el, encoding="unicode")
+
+
+_CONNECTORS = set("""
+et ou de des du la le les l en à au aux pour par sur avec sans dans d un une que qui
+und oder der die das den dem des im in mit für von zu zur zum bei auf an aus nach ein eine
+and or of the to for with
+""".split())
+
+
+def _para_text(p):
+    return "".join(t.text or "" for t in p.iter(A + "t"))
+
+
+def _has_bullet(p, chain):
+    """Puce visible (y compris heritee du gabarit) ?"""
+    ppr = p.find(A + "pPr")
+    lvl = int(ppr.get("lvl", "0")) if ppr is not None else 0
+    cands = [ppr] + [Chain._lvl(el, lvl) for el in chain.lst]
+    for c in cands:
+        if c is None:
+            continue
+        if c.find(A + "buNone") is not None:
             return False
-
-        french_markers = [
-            "indicateurs hebdomadaires", "chiffres clés",
-            "point de collecte", "sas d'entrée"
-        ]
-        if any(m in t_lower for m in french_markers):
+        if c.find(A + "buChar") is not None or c.find(A + "buAutoNum") is not None                 or c.find(A + "buBlip") is not None:
             return True
-
     return False
 
-def fix_french_grammar(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r'\bauprès\s+de\s*(<[^>]+>)?\s*les\b', r'auprès des \1', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bauprès\s+de\s*(<[^>]+>)?\s*le\b', r'auprès du \1', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bà\s*(<[^>]+>)?\s*les\b', r'aux \1', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bà\s*(<[^>]+>)?\s*le\b', r'au \1', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bde\s*(<[^>]+>)?\s*les\b', r'des \1', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bde\s*(<[^>]+>)?\s*le\b', r'du \1', text, flags=re.IGNORECASE)
-    return re.sub(r'  +', ' ', text)
 
-def sanitize_pptx_translation(orig_text, trans_text, direction="Allemand ➔ Français"):
-    if not trans_text or not trans_text.strip():
-        return orig_text
-    bad_phrases = [
-        "pourriez-vous", "veuillez fournir", "je suis prêt",
-        "texte à traduire", "n'hésitez pas", "voici la traduction",
-        "tableau json", "données à traduire"
-    ]
-    trans_lower = trans_text.lower()
-    for bp in bad_phrases:
-        if bp in trans_lower and bp not in orig_text.lower():
-            return re.sub(r'</?r[^>]*>', '', orig_text)
+def is_continuation(prev, nxt, body):
+    """Le paragraphe `nxt` continue-t-il la phrase de `prev` ?
 
-    if re.search(r'\bdv\.\b', orig_text):
-        trans_text = re.sub(r'\bdavon\b', 'dv.', trans_text, flags=re.IGNORECASE)
+    Une phrase coupee par Entree (retour a la ligne fait a la main) donne
+    deux paragraphes ; traduits separement, la coupure tombe au milieu de
+    la phrase traduite. Il faut : meme niveau, pas de puce sur la suite,
+    une phrase qui ne se termine pas, une ligne coupee qui remplit au moins
+    la moitie du cadre, et une suite en minuscule ou apres un mot de
+    liaison ("et", "und"...) ou un trait d'union.
+    """
+    a, b = _para_text(prev).rstrip(), _para_text(nxt).lstrip()
+    if not a or not b:
+        return False
+    if a[-1] in ".:;!?),•" or b[0] in "-•–*·>" or re.match(r"^\d+[.)]", b):
+        return False
+    pp, pn = prev.find(A + "pPr"), nxt.find(A + "pPr")
+    if (pp.get("lvl", "0") if pp is not None else "0") != (pn.get("lvl", "0") if pn is not None else "0"):
+        return False
+    if _has_bullet(nxt, body.chain):
+        return False
+    words = re.findall(r"[^\W\d_]+", a.lower())
+    linked = bool(words) and words[-1] in _CONNECTORS or a[-1] in "-/&+"
+    fill = None
+    if body.width:
+        try:
+            l, r, _, _ = _insets(body)
+            para = measure_paragraph(body.chain, prev, original_runs(prev))
+            avail = body.width - l - r - para.indent
+            _, _, w = layout([para], 1e9, 1.0, 0.0, False)
+            if avail > 0:
+                fill = 1.0 if w >= avail else w / avail
+        except Exception:
+            fill = None
+    if fill is not None and fill < 0.5:
+        return False        # ligne courte : retour voulu
+    if b[0].islower() or linked:
+        return True
+    # Ligne presque pleine, phrase non terminee : retour fait a la main
+    # meme si la suite commence par une majuscule ("rayon" + "DPH").
+    return fill is not None and fill >= 0.85 and b[0].isalpha()
 
-    # Protection contre le retour intempestif d'Indicateurs hebdomadaires
-    if direction == "Français ➔ Allemand":
-        if re.search(r'\bWochenkennzahlen\b', orig_text, re.IGNORECASE):
-            trans_text = re.sub(r'\bIndicateurs hebdomadaires\b', 'Wochenkennzahlen', trans_text, flags=re.IGNORECASE)
 
-    if direction == "Allemand ➔ Français":
-        return fix_french_grammar(trans_text)
-    return trans_text
+def group_segment(paras):
+    """Segment pour plusieurs paragraphes formant une seule phrase. Le
+    texte traduit ira dans le premier, les suivants seront retires."""
+    seg = paragraph_segment(paras[0], require_text=False)
+    for nxt in paras[1:]:
+        prev_text = "".join(it[2] for it in seg.items if it[0] == "t")
+        nseg = paragraph_segment(nxt, require_text=False)
+        first = next((it for it in nseg.items if it[0] == "t"), None)
+        if prev_text.endswith(("-", "/")) and not prev_text.endswith((" -", " /")):
+            # "stop-" + "produit", "terre/" + "oignons" : on recolle sans
+            # espace et on garde le signe (le modele traduit le mot entier).
+            pass
+        elif prev_text and not prev_text.endswith(" "):
+            last_style = next((it for it in reversed(seg.items) if it[0] == "t"), None)
+            sid = last_style[1] if last_style else 0
+            seg.items.append(("t", sid, " "))
+        # Reprise des morceaux du paragraphe suivant avec leurs styles.
+        for it in nseg.items:
+            if it[0] == "t":
+                key = nseg.meta["keys"][it[1]]
+                seg.add_text(it[2], key, nseg.styles[it[1]])
+            elif it[0] == "x":
+                seg.add_object(nseg.objects[it[1]])
+            else:
+                seg.add_break(it[0])
+            if it[0] == "br":
+                seg.meta.setdefault("br", nseg.meta.get("br"))
+    seg.meta["merged"] = list(paras[1:])
+    return seg if seg.has_text() else None
 
-# --- GESTION DU XML ET DES PROPRIÉTÉS FINES ---
 
-def add_br(p):
-    """Ajoute un saut forcé XML <a:br/> conforme au schéma DrawingML."""
-    try:
-        br = parse_xml(f'<a:br {nsdecls("a")}/>')
-        endParaRPr = p._p.find(qn('a:endParaRPr'))
-        if endParaRPr is not None:
-            endParaRPr.addprevious(br)
+def paragraph_segment(p, require_text=True):
+    """Segment pour un <a:p> ; None s'il n'y a rien a traduire."""
+    seg = Segment()
+    seg.meta["p"] = p
+    seg.meta["keys"] = {}
+    for child in p:
+        tag = child.tag
+        if tag == A + "pPr" or tag == A + "endParaRPr":
+            continue
+        if tag == A + "r":
+            rpr = child.find(A + "rPr")
+            t = child.find(A + "t")
+            text = t.text if t is not None and t.text else ""
+            parts = text.split("\t")
+            key = _style_key(rpr)
+            for k, part in enumerate(parts):
+                if k:
+                    seg.add_break("tab")
+                seg.add_text(part, key, rpr)
+                if part:
+                    seg.meta["keys"][seg.items[-1][1]] = key
+        elif tag == A + "br":
+            seg.meta.setdefault("br", child)
+            seg.add_break("br")
         else:
-            p._p.append(br)
-    except Exception:
-        pass
+            # Champ (a:fld), formule, extension... : objet conserve tel quel.
+            seg.add_object(child)
+    if not require_text:
+        return seg
+    return seg if seg.has_text() else None
 
-def lock_shape_geometry(tf):
-    """Active le word wrap et verrouille la géométrie de la boîte."""
-    try:
-        tf.word_wrap = True
-        tf.vertical_anchor = MSO_ANCHOR.TOP
-        tf.margin_top = Pt(1.0)
-        tf.margin_bottom = Pt(1.0)
-        body_pr = tf._txBody.bodyPr
-        for child in list(body_pr):
-            if child.tag.endswith('spAutoFit') or child.tag.endswith('normAutofit'):
-                body_pr.remove(child)
-        if not any(child.tag.endswith('noAutofit') for child in body_pr):
-            body_pr.append(parse_xml(f'<a:noAutofit {nsdecls("a")}/>'))
-    except Exception:
-        pass
 
-def _copy_font_style(src_font, dst_font):
-    """Copie fidèlement les attributs d'une police."""
-    try:
-        if src_font.name: dst_font.name = src_font.name
-        if src_font.size: dst_font.size = src_font.size
-        if src_font.bold is not None: dst_font.bold = src_font.bold
-        if src_font.italic is not None: dst_font.italic = src_font.italic
-        if src_font.underline is not None: dst_font.underline = src_font.underline
-        if src_font.color and src_font.color.type is not None:
-            if src_font.color.type == 1:
-                dst_font.color.rgb = src_font.color.rgb
-            elif src_font.color.type == 2:
-                dst_font.color.theme_color = src_font.color.theme_color
-                if hasattr(src_font.color, 'brightness') and src_font.color.brightness is not None:
-                    dst_font.color.brightness = src_font.color.brightness
-    except Exception:
-        pass
+def rebuild_paragraph(seg, items, target_lang):
+    """Remplace le contenu de <a:p> par la traduction."""
+    p = seg.meta["p"]
+    end = p.find(A + "endParaRPr")
+    for child in list(p):
+        if child.tag not in (A + "pPr", A + "endParaRPr"):
+            p.remove(child)
 
-def get_paragraph_base_size(p):
-    """Extrait la taille de référence du paragraphe s'il en possède une."""
-    for r in p.runs:
-        if r.font and r.font.size:
-            return r.font.size.pt
-    if p.font and p.font.size:
-        return p.font.size.pt
+    def insert(el):
+        if end is not None:
+            end.addprevious(el)
+        else:
+            p.append(el)
+
+    locale = LOCALE.get(target_lang)
+
+    def new_run(text, rpr):
+        r = etree.Element(A + "r")
+        if rpr is not None:
+            rp = copy.deepcopy(rpr)
+            if locale and rp.get("lang"):
+                rp.set("lang", locale)
+            r.append(rp)
+        t = etree.SubElement(r, A + "t")
+        t.text = text
+        insert(r)
+
+    def new_br(rpr):
+        src = seg.meta.get("br")
+        if src is not None:
+            br = copy.deepcopy(src)
+        else:
+            br = etree.Element(A + "br")
+            if rpr is not None:
+                br.append(copy.deepcopy(rpr))
+        insert(br)
+
+    last_rpr = seg.styles.get(seg.base_style())
+    for it in items:
+        kind = it[0]
+        if kind == "t":
+            rpr = seg.styles.get(it[1])
+            for k, piece in enumerate(it[2].split("\n")):
+                if k:
+                    new_br(rpr)
+                if piece:
+                    new_run(piece, rpr)
+            last_rpr = rpr
+        elif kind == "tab":
+            # Tabulation : un run d'un seul caractere dans le style voisin.
+            new_run("\t", last_rpr)
+        elif kind == "br":
+            new_br(last_rpr)
+        elif kind == "x":
+            insert(seg.objects[it[1]])
+    if end is not None and locale and end.get("lang"):
+        end.set("lang", locale)
+    for other in seg.meta.get("merged", []):
+        parent = other.getparent()
+        if parent is not None:
+            parent.remove(other)
+
+
+# --------------------------------------------------------------------------
+# Styles effectifs (heritage PowerPoint)
+# --------------------------------------------------------------------------
+
+class Theme:
+    def __init__(self, master=None):
+        self.major = self.minor = "Arial"
+        if master is None:
+            return
+        try:
+            part = master.part.part_related_by(RT.THEME)
+            root = etree.fromstring(part.blob)
+            mj = root.find(".//" + A + "majorFont/" + A + "latin")
+            mn = root.find(".//" + A + "minorFont/" + A + "latin")
+            if mj is not None:
+                self.major = mj.get("typeface") or self.major
+            if mn is not None:
+                self.minor = mn.get("typeface") or self.minor
+        except Exception:
+            pass
+
+    def resolve(self, face):
+        if not face:
+            return None
+        if face.startswith("+mj"):
+            return self.major
+        if face.startswith("+mn"):
+            return self.minor
+        return face
+
+
+class Chain:
+    """Pile des styles de liste dont herite un corps de texte, du plus
+    specifique au plus general, et pile des bodyPr (forme puis gabarits)."""
+
+    def __init__(self, lst_styles, body_prs, theme, title=False):
+        self.lst = [x for x in lst_styles if x is not None]
+        self.body = [x for x in body_prs if x is not None]
+        self.theme = theme or Theme()
+        self.title = title
+
+    @staticmethod
+    def _lvl(el, lvl):
+        return el.find(A + "lvl%dpPr" % (lvl + 1))
+
+    def ppr_attr(self, p, lvl, name):
+        ppr = p.find(A + "pPr")
+        if ppr is not None and ppr.get(name) is not None:
+            return ppr.get(name)
+        for el in self.lst:
+            lp = self._lvl(el, lvl)
+            if lp is not None and lp.get(name) is not None:
+                return lp.get(name)
+        return None
+
+    def ppr_spacing(self, p, lvl, tag):
+        cands = []
+        ppr = p.find(A + "pPr")
+        if ppr is not None:
+            cands.append(ppr)
+        cands += [self._lvl(el, lvl) for el in self.lst]
+        for c in cands:
+            if c is None:
+                continue
+            sp = c.find(A + tag)
+            if sp is not None and len(sp):
+                v = sp[0]
+                if v.tag == A + "spcPct":
+                    return ("pct", int(v.get("val", "100000")) / 100000.0)
+                if v.tag == A + "spcPts":
+                    return ("pts", int(v.get("val", "0")) / 100.0)
+        return None
+
+    def rpr_attr(self, rpr, lvl, name):
+        if rpr is not None and rpr.get(name) is not None:
+            return rpr.get(name)
+        for el in self.lst:
+            lp = self._lvl(el, lvl)
+            if lp is not None:
+                d = lp.find(A + "defRPr")
+                if d is not None and d.get(name) is not None:
+                    return d.get(name)
+        return None
+
+    def latin(self, rpr, lvl):
+        if rpr is not None:
+            lat = rpr.find(A + "latin")
+            if lat is not None and lat.get("typeface"):
+                return self.theme.resolve(lat.get("typeface"))
+        for el in self.lst:
+            lp = self._lvl(el, lvl)
+            if lp is not None:
+                lat = lp.find(A + "defRPr/" + A + "latin")
+                if lat is not None and lat.get("typeface"):
+                    return self.theme.resolve(lat.get("typeface"))
+        return self.theme.major if self.title else self.theme.minor
+
+    def body_attr(self, name, default=None):
+        for b in self.body:
+            if b.get(name) is not None:
+                return b.get(name)
+        return default
+
+    def autofit(self):
+        for b in self.body:
+            for tag in ("normAutofit", "spAutoFit", "noAutofit"):
+                el = b.find(A + tag)
+                if el is not None:
+                    return tag, el
+        return None, None
+
+
+def _bool(v):
+    return v in ("1", "true", "on")
+
+
+def run_metrics(chain, rpr, lvl):
+    size = chain.rpr_attr(rpr, lvl, "sz")
+    size = int(size) / 100.0 if size else 18.0
+    bold = _bool(chain.rpr_attr(rpr, lvl, "b"))
+    italic = _bool(chain.rpr_attr(rpr, lvl, "i"))
+    return size, get_font(chain.latin(rpr, lvl), bold, italic)
+
+
+def measure_paragraph(chain, p, runs):
+    """runs : [(texte, rPr)] -> Para mesurable."""
+    ppr = p.find(A + "pPr")
+    lvl = int(ppr.get("lvl", "0")) if ppr is not None else 0
+    out = []
+    for text, rpr in runs:
+        size, font = run_metrics(chain, rpr, lvl)
+        out.append(Run(text, size, font))
+    if not out:
+        size, font = run_metrics(chain, p.find(A + "endParaRPr"), lvl)
+        out.append(Run("", size, font))
+    ls = chain.ppr_spacing(p, lvl, "lnSpc") or ("pct", 1.0)
+    first_size = out[0].size
+
+    def spc(tag):
+        v = chain.ppr_spacing(p, lvl, tag)
+        if not v:
+            return 0.0
+        return v[1] if v[0] == "pts" else v[1] * first_size * 1.2
+
+    mar = chain.ppr_attr(p, lvl, "marL")
+    ind = chain.ppr_attr(p, lvl, "indent")
+    return Para(out, ls, spc("spcBef"), spc("spcAft"),
+                indent=(int(mar) / EMU_PER_PT) if mar else 0.0,
+                first_indent=(int(ind) / EMU_PER_PT) if ind and int(ind) > 0 else 0.0)
+
+
+def original_runs(p):
+    runs = []
+    for child in p:
+        if child.tag in (A + "r", A + "fld"):
+            t = child.find(A + "t")
+            runs.append(((t.text or "") if t is not None else "", child.find(A + "rPr")))
+        elif child.tag == A + "br":
+            runs.append(("\n", child.find(A + "rPr")))
+    return runs
+
+
+def translated_runs(seg, items):
+    runs = []
+    last = seg.styles.get(seg.base_style())
+    for it in items:
+        if it[0] == "t":
+            runs.append((it[2], seg.styles.get(it[1])))
+            last = seg.styles.get(it[1])
+        elif it[0] == "br":
+            runs.append(("\n", last))
+        elif it[0] == "tab":
+            runs.append(("    ", last))
+        elif it[0] == "x":
+            el = seg.objects[it[1]]
+            t = el.find(A + "t")
+            if t is not None and t.text:
+                runs.append((t.text, el.find(A + "rPr")))
+    return runs
+
+
+# --------------------------------------------------------------------------
+# Inventaire des corps de texte
+# --------------------------------------------------------------------------
+
+class Body:
+    """Un corps de texte (forme, cellule, note...) et sa geometrie."""
+
+    def __init__(self, txBody, chain, width=None, height=None, kind="shape",
+                 context="", shape=None, slide_h=None, rects=None, cell=None,
+                 rect=None, framed=False):
+        self.txBody = txBody
+        self.chain = chain
+        self.width = width          # en points, None si inconnu
+        self.height = height
+        self.kind = kind            # shape, cell, notes, chart, smartart
+        self.context = context
+        self.shape = shape
+        self.slide_h = slide_h
+        self.rects = rects if rects is not None else []   # formes de la diapositive
+        self.rect = rect            # (x0, y0, x1, y1) absolu, en points
+        self.framed = framed        # fond ou bordure visible
+        self.cell = cell            # (ligne, colonne, nb lignes, tc) pour une cellule
+        self.paras = txBody.findall(A + "p")
+        self.seg_index = {}         # index du paragraphe -> index du segment
+        self.merged = set()         # paragraphes fusionnes dans le precedent
+
+
+def _insets(body):
+    if body.kind == "cell":
+        tc = body.cell[3].find(A + "tcPr")
+
+        def get(k, d):
+            return (int(tc.get(k)) if tc is not None and tc.get(k) else d) / EMU_PER_PT
+        return get("marL", 91440), get("marR", 91440), get("marT", 45720), get("marB", 45720)
+
+    def g(k, d):
+        return int(body.chain.body_attr(k, d)) / EMU_PER_PT
+    return g("lIns", 91440), g("rIns", 91440), g("tIns", 45720), g("bIns", 45720)
+
+
+class Inventory:
+    def __init__(self, prs):
+        self.prs = prs
+        self.bodies = []
+        self.blob_parts = []
+        self.default_style = prs.part._element.find(P + "defaultTextStyle")
+        self.slide_h = prs.slide_height / EMU_PER_PT if prs.slide_height else None
+        self._themes = {}
+
+    def theme(self, master):
+        key = id(master.part)
+        if key not in self._themes:
+            self._themes[key] = Theme(master)
+        return self._themes[key]
+
+    def chain_for_shape(self, shape, master):
+        tb = shape._element.find(".//" + P + "txBody")
+        lst, bodies = [], []
+        if tb is not None:
+            lst.append(tb.find(A + "lstStyle"))
+            bodies.append(tb.find(A + "bodyPr"))
+        title = False
+        tx = master._element.find(P + "txStyles")
+        if getattr(shape, "is_placeholder", False):
+            try:
+                ph_type = shape.placeholder_format.type
+            except Exception:
+                ph_type = None
+            title = ph_type in _TITLE_TYPES
+            base = shape
+            for _ in range(2):      # disposition puis masque
+                try:
+                    base = base._base_placeholder
+                except Exception:
+                    base = None
+                if base is None:
+                    break
+                btb = base._element.find(".//" + P + "txBody")
+                if btb is not None:
+                    lst.append(btb.find(A + "lstStyle"))
+                    bodies.append(btb.find(A + "bodyPr"))
+            if tx is not None:
+                name = "titleStyle" if title else ("otherStyle" if ph_type in _OTHER_TYPES else "bodyStyle")
+                lst.append(tx.find(P + name))
+        elif tx is not None:
+            lst.append(tx.find(P + "otherStyle"))
+        lst.append(self.default_style)
+        return Chain(lst, bodies, self.theme(master), title)
+
+    def walk_shapes(self, shapes, master, where, xf=(0, 0, 0, 0, 1.0, 1.0), rects=None):
+        """Parcourt les formes ; xf convertit les coordonnees d'un groupe en
+        coordonnees de la diapositive : (ox, oy, chx, chy, sx, sy) en EMU."""
+        rects = rects if rects is not None else []
+        ox, oy, chx, chy, sx, sy = xf
+        for shape in shapes:
+            try:
+                st = shape.shape_type
+            except Exception:
+                st = None
+            try:
+                x0 = ox + (shape.left - chx) * sx
+                y0 = oy + (shape.top - chy) * sy
+                w_emu, h_emu = shape.width * sx, shape.height * sy
+                rect = (x0 / EMU_PER_PT, y0 / EMU_PER_PT,
+                        (x0 + w_emu) / EMU_PER_PT, (y0 + h_emu) / EMU_PER_PT)
+            except Exception:
+                rect = None
+            if st == MSO_SHAPE_TYPE.GROUP:
+                try:
+                    xfrm = shape._element.grpSpPr.find(A + "xfrm")
+                    off, ext = xfrm.find(A + "off"), xfrm.find(A + "ext")
+                    choff, chext = xfrm.find(A + "chOff"), xfrm.find(A + "chExt")
+                    gx = ox + (int(off.get("x")) - chx) * sx
+                    gy = oy + (int(off.get("y")) - chy) * sy
+                    cw, chh = int(chext.get("cx")), int(chext.get("cy"))
+                    gsx = sx * (int(ext.get("cx")) / cw if cw else 1.0)
+                    gsy = sy * (int(ext.get("cy")) / chh if chh else 1.0)
+                    child = (gx, gy, int(choff.get("x")), int(choff.get("y")), gsx, gsy)
+                except Exception:
+                    child = xf
+                self.walk_shapes(shape.shapes, master, where, child, rects)
+                continue
+            entry = {"rect": rect, "framed": _is_framed(shape._element), "el": shape._element}
+            if rect is not None:
+                rects.append(entry)
+            if getattr(shape, "has_table", False) and shape.has_table:
+                self.add_table(shape, master, where, (sx, sy), rects, rect)
+                continue
+            if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+                w = (rect[2] - rect[0]) if rect else None
+                h = (rect[3] - rect[1]) if rect else None
+                chain = self.chain_for_shape(shape, master)
+                label = "titre" if chain.title else "zone de texte"
+                if w and h:
+                    label += " (%d x %d pt)" % (w, h)
+                self.bodies.append(Body(shape.text_frame._txBody, chain, w, h, "shape",
+                                        "%s, %s" % (where, label), shape=shape,
+                                        slide_h=self.slide_h, rects=rects, rect=rect,
+                                        framed=entry["framed"]))
+
+    def add_table(self, gf, master, where, scale, rects, rect):
+        tbl = gf.table
+        cols = [c.width / EMU_PER_PT * scale[0] for c in tbl.columns]
+        rows = [r.height / EMU_PER_PT * scale[1] for r in tbl.rows]
+        theme = self.theme(master)
+        for ri, row in enumerate(tbl.rows):
+            for ci, cell in enumerate(row.cells):
+                tc = cell._tc
+                if tc.get("hMerge") in ("1", "true") or tc.get("vMerge") in ("1", "true"):
+                    continue
+                gs, rs = int(tc.get("gridSpan", "1")), int(tc.get("rowSpan", "1"))
+                txb = tc.find(A + "txBody")
+                if txb is None:
+                    continue
+                chain = Chain([txb.find(A + "lstStyle"), self.default_style],
+                              [txb.find(A + "bodyPr")], theme)
+                self.bodies.append(Body(txb, chain, sum(cols[ci:ci + gs]), sum(rows[ri:ri + rs]),
+                                        "cell", "%s, cellule de tableau" % where, shape=gf,
+                                        slide_h=self.slide_h, cell=(ri, ci, rs, tc),
+                                        rects=rects, rect=rect, framed=True))
+
+    def collect(self):
+        prs = self.prs
+        for n, slide in enumerate(prs.slides, start=1):
+            master = slide.slide_layout.slide_master
+            self.walk_shapes(slide.shapes, master, "diapositive %d" % n)
+            if slide.has_notes_slide:
+                tf = slide.notes_slide.notes_text_frame
+                if tf is not None:
+                    chain = Chain([tf._txBody.find(A + "lstStyle")], [], self.theme(master))
+                    self.bodies.append(Body(tf._txBody, chain, kind="notes",
+                                            context="diapositive %d, notes" % n))
+        for master in prs.slide_masters:
+            self.walk_shapes(master.shapes, master, "masque")
+            for lay in master.slide_layouts:
+                self.walk_shapes(lay.shapes, master, "disposition")
+        # Graphiques et SmartArt : texte sans cadre mesurable.
+        for part in prs.part.package.iter_parts():
+            ct = part.content_type
+            if ct.endswith("drawingml.chart+xml") and hasattr(part, "_element"):
+                for txb in part._element.iter(C + "rich"):
+                    self.bodies.append(Body(txb, Chain([], [], None), kind="chart",
+                                            context="titre de graphique"))
+            elif ct.endswith("diagramData+xml") or ct.endswith("diagramDrawing+xml"):
+                try:
+                    root = etree.fromstring(part.blob)
+                except Exception:
+                    continue
+                self.blob_parts.append((part, root))
+                for el in root.iter():
+                    if (el.tag.endswith("}t") or el.tag.endswith("}txBody")) \
+                            and el.find(A + "p") is not None:
+                        self.bodies.append(Body(el, Chain([], [], None), kind="smartart",
+                                                context="SmartArt"))
+
+
+def _is_framed(el):
+    """La forme a-t-elle un fond ou une bordure visibles ? Une zone de texte
+    sans fond ni bordure peut laisser son texte deborder dans le vide ;
+    un cadre visible doit le contenir."""
+    tag = el.tag.split("}")[-1]
+    if tag in ("pic", "graphicFrame"):
+        return True
+    sppr = el.find(P + "spPr")
+    style = el.find(P + "style")
+
+    def ref_idx(name):
+        if style is None:
+            return 0
+        r = style.find(A + name)
+        return int(r.get("idx", "0")) if r is not None else 0
+
+    fill = False
+    if sppr is not None:
+        if any(sppr.find(A + t) is not None for t in ("solidFill", "gradFill", "pattFill", "blipFill")):
+            fill = True
+        elif sppr.find(A + "noFill") is None and ref_idx("fillRef") > 0:
+            fill = True
+    line = False
+    ln = sppr.find(A + "ln") if sppr is not None else None
+    if ln is not None:
+        if ln.find(A + "noFill") is None and (
+                ln.find(A + "solidFill") is not None or ln.find(A + "gradFill") is not None
+                or ref_idx("lnRef") > 0):
+            line = True
+    elif ref_idx("lnRef") > 0:
+        line = True
+    return fill or line
+
+
+def _free_space(body):
+    """Place libre (pts) sous et au-dessus de la forme, jusqu'a la forme
+    suivante qui la chevauche horizontalement, au bord du cadre qui la
+    contient, ou au bord de la diapositive."""
+    if body.rect is None:
+        return 0.0, 0.0
+    x0, y0, x1, y1 = body.rect
+    below = (body.slide_h - y1 - 2.0) if body.slide_h else 0.0
+    above = y0 - 2.0
+    own = body.shape._element if body.shape is not None else None
+    for r in body.rects:
+        rr = r["rect"]
+        if rr is None or r["el"] is own:
+            continue
+        if min(x1, rr[2]) - max(x0, rr[0]) <= 2.0:
+            continue        # pas de recouvrement horizontal
+        if rr[0] <= x0 + 1 and rr[2] >= x1 - 1 and rr[1] <= y0 + 1 and rr[3] >= y1 - 1:
+            # cadre qui contient la forme : on reste dedans
+            below = min(below, rr[3] - y1 - 3.0)
+            above = min(above, y0 - rr[1] - 3.0)
+        elif rr[1] >= y1 - 1:
+            below = min(below, rr[1] - y1 - 2.0)
+        elif rr[3] <= y0 + 1:
+            above = min(above, y0 - rr[3] - 2.0)
+        else:
+            # forme qui empiete sur la zone : pas de marge de ce cote
+            if rr[1] > y0:
+                below = min(below, 0.0)
+            if rr[3] < y1:
+                above = min(above, 0.0)
+    return max(0.0, below), max(0.0, above)
+
+
+def _extra_room(body):
+    """Hauteur supplementaire que le texte peut occuper hors de sa forme
+    sans gener : 0 pour un cadre visible ou une cellule."""
+    if body.kind != "shape" or body.framed:
+        return 0.0
+    below, above = _free_space(body)
+    anchor = body.chain.body_attr("anchor", "t")
+    if anchor == "b":
+        return above
+    if anchor == "ctr":
+        return 2 * min(below, above)
+    return below
+
+
+def chart_value_segments(prs):
+    """<c:v> des caches de chaines des graphiques (series, categories)."""
+    out = []
+    for part in prs.part.package.iter_parts():
+        if not part.content_type.endswith("drawingml.chart+xml") or not hasattr(part, "_element"):
+            continue
+        for cache in part._element.iter(C + "strCache"):
+            for v in cache.iter(C + "v"):
+                if v.text and v.text.strip():
+                    seg = Segment()
+                    seg.add_text(v.text, "-", None)
+                    seg.meta["v"] = v
+                    out.append(seg)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Ajustement
+# --------------------------------------------------------------------------
+
+# Marge de securite sur la largeur pour la traduction : la mesure n'est
+# pas au pixel pres, et une ligne pile a la limite peut passer a la ligne
+# chez PowerPoint.
+WIDTH_SAFETY = 0.985
+
+
+def _body_layout(body, para_runs, scale, width_factor=1.0):
+    """Hauteur et largeur occupees par le corps pour des runs donnes, et
+    place disponible (largeur, hauteur, retour a la ligne)."""
+    paras = [measure_paragraph(body.chain, p, runs) for p, runs in zip(body.paras, para_runs)
+             if runs is not None]
+    l, r, t, b = _insets(body)
+    # Dans un tableau, PowerPoint revient toujours a la ligne, meme avec
+    # wrap="none" dans le XML.
+    wrap = body.kind == "cell" or body.chain.body_attr("wrap", "square") != "none"
+    width = (body.width or 0) - l - r
+    h, lines, w = layout(paras, width * width_factor, scale, 0.0, wrap)
+    return h, w, lines, (width, (body.height or 0) - t - b, wrap)
+
+
+def _vertical(body):
+    return body.chain.body_attr("vert", "horz") not in (None, "horz")
+
+
+def needed_scale(body, orig_runs, new_runs, start_scale, extra=0.0):
+    """Echelle (<= start_scale) a laquelle la traduction tient dans la
+    place disponible : la forme, ou ce qu'occupait deja l'original, plus
+    `extra` points de place libre autour. None si meme MIN_SCALE ne
+    suffit pas."""
+    h_o, w_o, _, (avail_w, avail_h, wrap) = _body_layout(body, orig_runs, start_scale)
+    limit_h = max(avail_h + extra, h_o) + 0.5
+    limit_w = max(avail_w, w_o) + 0.5
+    s = start_scale
+    while s >= MIN_SCALE - 1e-9:
+        h, w, _, _ = _body_layout(body, new_runs, s, WIDTH_SAFETY)
+        if h <= limit_h and (wrap or w <= limit_w * WIDTH_SAFETY):
+            return s
+        s = round(s - SCALE_STEP, 4)
     return None
 
-# --- SIMULATEUR DE DÉBORDEMENT CALIBRÉ ---
 
-def calculate_optimal_container_scale(paragraphs_data, box_width_pt, box_height_pt):
-    """Simule la mise en page exacte dans la boîte."""
-    if not box_width_pt or not box_height_pt:
-        return 1.0
+def overflow_at(body, orig_runs, new_runs, scale):
+    """Points de hauteur qui manquent a la traduction a cette echelle."""
+    h_o, _, _, (_, avail_h, _) = _body_layout(body, orig_runs, scale)
+    h, _, _, _ = _body_layout(body, new_runs, scale, WIDTH_SAFETY)
+    return max(0.0, h - max(avail_h, h_o) - 0.5)
 
-    scalable = [item for item in paragraphs_data if item['base_size'] and item['base_size'] <= 18.0 and not item['is_title']]
-    if not scalable:
-        return 1.0
 
-    usable_w = max(20.0, box_width_pt - 10.0)
-    usable_h = box_height_pt if box_height_pt <= 25.0 else max(10.0, box_height_pt - 2.0)
-
-    for scale in [1.0, 0.95, 0.90, 0.85, 0.80]:
-        total_h = 0.0
-        for item in paragraphs_data:
-            text = item['text']
-            base_sz = item['base_size']
-            is_title = item['is_title']
-
-            if not text.strip():
-                total_h += (base_sz or 10.0) * 0.20
-                continue
-
-            curr_sz = base_sz if (is_title or base_sz is None or base_sz > 18.0) else base_sz * scale
-            char_w = curr_sz * 0.46
-            chars_per_line = max(10, int(usable_w / char_w))
-
-            sub_lines = text.split('\n')
-            lines = 0
-            for sub in sub_lines:
-                sub_clean = sub.strip()
-                if not sub_clean:
-                    lines += 1
-                else:
-                    lines += max(1, (len(sub_clean) + chars_per_line - 1) // chars_per_line)
-
-            line_h = curr_sz * 1.08
-            total_h += (lines * line_h) + (0.5 if lines > 1 else 0.0)
-
-        if total_h <= usable_h:
-            return scale
-
-    return 0.80
-
-def merge_continuation_paragraphs_in_textbox(tf):
-    """Rassemble les faux paragraphes coupés par 'Entrée' au milieu d'une phrase."""
-    paras = list(tf.paragraphs)
-    if len(paras) <= 1:
+def apply_scale(body, scale):
+    """Reduit la taille du texte de tout le corps d'un facteur `scale`."""
+    own_bp = body.txBody.find(A + "bodyPr")
+    if body.kind == "shape" and own_bp is not None and own_bp.find(A + "normAutofit") is not None:
+        # Deja en "reduire le texte si necessaire" : PowerPoint applique
+        # fontScale a tout le corps.
+        own_bp.find(A + "normAutofit").set("fontScale", str(int(round(scale * 100000))))
         return
+    for p in body.paras:
+        ppr = p.find(A + "pPr")
+        lvl = int(ppr.get("lvl", "0")) if ppr is not None else 0
+        for el in list(p):
+            if el.tag in (A + "r", A + "fld", A + "br"):
+                rpr = el.find(A + "rPr")
+                if rpr is None:
+                    rpr = etree.Element(A + "rPr")
+                    el.insert(0, rpr)
+            elif el.tag == A + "endParaRPr":
+                rpr = el
+            else:
+                continue
+            size, _ = run_metrics(body.chain, rpr, lvl)
+            new = _round_size(size * scale)
+            rpr.set("sz", str(int(round(new * 100))))
 
-    i = 0
-    while i < len(paras) - 1:
-        curr_p = paras[i]
-        next_p = paras[i + 1]
 
-        # Protège impérativement les numéros de page dynamiques
-        if curr_p._element.xpath('.//a:fld') or next_p._element.xpath('.//a:fld'):
-            i += 1
-            continue
+def _round_size(size):
+    """Demi-point inferieur : arrondir vers le haut ferait deborder."""
+    return max(1.0, math.floor(size * 2 + 1e-6) / 2)
 
-        if curr_p.level != next_p.level:
-            i += 1
-            continue
 
-        curr_text = curr_p.text.strip()
-        next_text = next_p.text.strip()
-
-        if not curr_text or not next_text:
-            i += 1
-            continue
-
-        if curr_text.endswith(':'):
-            i += 1
-            continue
-
-        if next_text.startswith(('-', '•', '–', '*', '·', '1.', '2.', '3.', '>')):
-            i += 1
-            continue
-
-        starts_with_lowercase = next_text[0].islower()
-        ends_with_connector = bool(re.search(
-            r'\b(des|de|du|d\'|par|sur|dans|en|pour|et|ou|avec|sans)\s*$',
-            curr_text, re.IGNORECASE
-        ))
-
-        if starts_with_lowercase or ends_with_connector:
-            space_run = curr_p.add_run()
-            space_run.text = " " if not curr_text.endswith(" ") else ""
-            if curr_p.runs:
-                _copy_font_style(curr_p.runs[0].font, space_run.font)
-
-            for r in next_p.runs:
-                new_r = curr_p.add_run()
-                new_r.text = r.text
-                _copy_font_style(r.font, new_r.font)
-
-            next_p._p.getparent().remove(next_p._p)
-            paras.pop(i + 1)
+def _runs_for(body, segments, results, orig):
+    """Runs a mesurer par paragraphe ; None pour un paragraphe fusionne
+    dans le precedent (il disparait a l'ecriture)."""
+    out = []
+    for pi in range(len(body.paras)):
+        i = body.seg_index.get(pi)
+        if i is not None and results[i] is not None:
+            out.append(translated_runs(segments[i], results[i]))
+        elif pi in body.merged and _owner_translated(body, pi, results):
+            out.append(None)
         else:
-            i += 1
+            out.append(orig[pi])
+    return out
 
-def serialize_paragraph_runs(p):
-    """Capture chaque run avec sa taille, sa graisse et sa couleur réelles."""
-    runs_data = []
-    run_idx = 0
-    raw_text = "".join(r.text for r in p.runs if r.text).strip()
-    is_short_title = len(raw_text) < 40 and not raw_text.startswith(('-', '•', '–', '*', '>')) and p.level == 0
-    
-    for child in p._p:
-        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-        if tag == 'br':
-            if is_short_title:
-                runs_data.append('<br/>')
-            else:
-                runs_data.append(' ')
-        elif tag == 'r':
-            from pptx.text.text import _Run
-            r = _Run(child, p)
-            txt = r.text
-            if not txt:
-                continue
-            
-            styles = []
-            if r.font.bold is True:
-                styles.append("b=1")
-            elif r.font.bold is False:
-                styles.append("b=0")
 
-            if r.font.italic is True:
-                styles.append("i=1")
-            elif r.font.italic is False:
-                styles.append("i=0")
-            
-            if r.font.size:
-                styles.append(f"s={round(r.font.size.pt, 1)}")
-            elif p.font.size:
-                styles.append(f"s={round(p.font.size.pt, 1)}")
-            
-            if r.font.color and r.font.color.type is not None:
-                try:
-                    if r.font.color.type == 1:
-                        styles.append(f"c={r.font.color.rgb}")
-                    elif r.font.color.type == 2:
-                        styles.append(f"t={r.font.color.theme_color}")
-                except Exception:
-                    pass
-                
-            style_attr = ";".join(styles)
-            if is_short_title:
-                txt_clean = txt.replace('\x0b', '<br/>').replace('\n', '<br/>')
-            else:
-                txt_clean = txt.replace('\x0b', ' ').replace('\n', ' ').replace('\r', ' ')
-            
-            if style_attr:
-                runs_data.append(f'<r id="{run_idx}" st="{style_attr}">{txt_clean}</r>')
-            else:
-                runs_data.append(f'<r id="{run_idx}">{txt_clean}</r>')
-            run_idx += 1
-            
-    return "".join(runs_data) if runs_data else p.text
+def _owner_translated(body, pi, results):
+    k = pi
+    while k >= 0 and k not in body.seg_index:
+        k -= 1
+    return k >= 0 and results[body.seg_index[k]] is not None
 
-def deserialize_paragraph_runs(p, tagged_text, container_scale=1.0):
-    """Reconstruit le paragraphe en restaurant strictement la graisse et les styles d'origine."""
-    if p._element.xpath('.//a:fld'):
-        return
 
-    orig_runs_info = [(r.font, r.text) for r in p.runs]
-    orig_raw_text = "".join(t for _, t in orig_runs_info).strip()
-    
-    lead_ws = ""
-    if orig_runs_info and orig_runs_info[0][1]:
-        match_ws = re.match(r'^(\s+)', orig_runs_info[0][1])
-        if match_ws:
-            lead_ws = match_ws.group(1)
+# --------------------------------------------------------------------------
+# Fonction principale
+# --------------------------------------------------------------------------
 
-    clean_trans_text = re.sub(r'<[^>]+>', '', tagged_text).strip()
-    is_short_title = len(orig_raw_text) < 40 and not orig_raw_text.startswith(('-', '•', '–', '*', '>')) and p.level == 0
-    is_dense = container_scale < 1.0 or len(clean_trans_text) > 40
-
-    if is_short_title:
-        current_run_idx = -1
-        orig_breaks_after = set()
-        for child in p._p:
-            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-            if tag == 'r':
-                current_run_idx += 1
-            elif tag == 'br':
-                if current_run_idx >= 0:
-                    orig_breaks_after.add(current_run_idx)
-        if orig_breaks_after and '<br' not in tagged_text:
-            for r_idx in sorted(orig_breaks_after, reverse=True):
-                tagged_text = re.sub(rf'(<r\s+id="{r_idx}"[^>]*>.*?</r>)', r'\1<br/>', tagged_text)
-    else:
-        tagged_text = re.sub(r'<br\s*/?>', ' ', tagged_text)
-
-    p.clear()
-
-    if not tagged_text.strip():
-        p.space_before = Pt(0)
-        p.space_after = Pt(0)
-        p.line_spacing = Pt(3)
-        return
-
-    if is_dense and not is_short_title:
-        p.space_before = Pt(0)
-        p.space_after = Pt(0.5)
-        p.line_spacing = 0.86
-
-    token_pattern = re.compile(r'(<br\s*/?>|<r(?:\s+id="(\d+)")?(?:\s+st="([^"]*)")?>(.*?)</r>)', re.DOTALL)
-    tokens = list(token_pattern.finditer(tagged_text))
-
-    if not tokens:
-        run = p.add_run()
-        clean_txt = re.sub(r'<[^>]+>', '', tagged_text).replace('\n', ' ').replace('\r', ' ')
-        run.text = lead_ws + clean_txt.lstrip()
-        if orig_runs_info:
-            _copy_font_style(orig_runs_info[0][0], run.font)
-            if run.font.size and run.font.size.pt <= 18.0 and not is_short_title:
-                clean_sz = round((run.font.size.pt * container_scale) * 2) / 2
-                run.font.size = Pt(clean_sz)
-        return
-
-    run_counter = 0
-    for m in tokens:
-        full_match = m.group(1)
-        if full_match.startswith('<br'):
-            add_br(p)
-            continue
-        
-        orig_id = int(m.group(2)) if m.group(2) else None
-        st_str = m.group(3) or ""
-        content = m.group(4)
-        
-        if not is_short_title:
-            content = content.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ')
-        
-        if run_counter == 0 and lead_ws and not content.startswith(lead_ws):
-            content = lead_ws + content.lstrip()
-        run_counter += 1
-        
-        content_subparts = re.split(r'<br\s*/?>', content)
-        for sub_idx, sub_text in enumerate(content_subparts):
-            if sub_idx > 0:
-                add_br(p)
-            
-            run = p.add_run()
-            run.text = sub_text
-            
-            if orig_id is not None and orig_id < len(orig_runs_info):
-                src_font = orig_runs_info[orig_id][0]
-                _copy_font_style(src_font, run.font)
-                run.font.bold = src_font.bold
-            else:
-                if "b=1" in st_str: run.font.bold = True
-                elif "b=0" in st_str: run.font.bold = False
-                
-            if "i=1" in st_str: run.font.italic = True
-            elif "i=0" in st_str: run.font.italic = False
-            
-            base_size = None
-            for part in st_str.split(";"):
-                if part.startswith("s="):
-                    try:
-                        base_size = float(part.split("=")[1])
-                    except Exception:
-                        pass
-            
-            if base_size is not None:
-                if base_size <= 18.0 and not is_short_title:
-                    clean_sz = round((base_size * container_scale) * 2) / 2
-                    run.font.size = Pt(clean_sz)
-                else:
-                    run.font.size = Pt(base_size)
-            elif run.font.size and run.font.size.pt <= 18.0 and not is_short_title:
-                clean_sz = round((run.font.size.pt * container_scale) * 2) / 2
-                run.font.size = Pt(clean_sz)
-
-# --- EXTRACTION GROUPÉE PAR CONTENEURS SANS ÉCRASER LES CHAMPS DYNAMIQUES ---
-
-def extract_all_pptx_containers(prs, direction="Allemand ➔ Français"):
-    """Extrait tous les conteneurs avec calcul de la largeur cumulée en cas de gridSpan."""
-    containers_list = []
-    
-    def _extract_from_shape(shape):
-        if shape.has_text_frame:
-            lock_shape_geometry(shape.text_frame)
-            merge_continuation_paragraphs_in_textbox(shape.text_frame)
-            valid_paras = []
-            for p in shape.text_frame.paragraphs:
-                if p._element.xpath('.//a:fld'):
-                    for r in p.runs:
-                        if direction == "Allemand ➔ Français" and "Seite" in r.text:
-                            r.text = r.text.replace("Seite", "Page")
-                        elif direction == "Français ➔ Allemand" and "Page" in r.text:
-                            r.text = r.text.replace("Page", "Seite")
-                elif p.text.strip():
-                    valid_paras.append(p)
-
-            if valid_paras:
-                containers_list.append({
-                    'tf': shape.text_frame,
-                    'box_width': shape.width.pt,
-                    'box_height': shape.height.pt,
-                    'paragraphs': valid_paras
-                })
-        elif shape.has_table:
-            for r_idx, row in enumerate(shape.table.rows):
-                for c_idx, cell in enumerate(row.cells):
-                    if cell._tc.attrib.get('hMerge') == '1':
-                        continue
-                    
-                    try: cell.text_frame.word_wrap = True
-                    except Exception: pass
-                    lock_shape_geometry(cell.text_frame)
-                    merge_continuation_paragraphs_in_textbox(cell.text_frame)
-                    valid_paras = []
-                    for p in cell.text_frame.paragraphs:
-                        if p._element.xpath('.//a:fld'):
-                            for r in p.runs:
-                                if direction == "Allemand ➔ Français" and "Seite" in r.text:
-                                    r.text = r.text.replace("Seite", "Page")
-                                elif direction == "Français ➔ Allemand" and "Page" in r.text:
-                                    r.text = r.text.replace("Page", "Seite")
-                        elif p.text.strip():
-                            valid_paras.append(p)
-                    
-                    if valid_paras:
-                        grid_span = int(cell._tc.attrib.get('gridSpan', '1'))
-                        total_col_width = sum(
-                            shape.table.columns[c].width.pt 
-                            for c in range(c_idx, min(len(shape.table.columns), c_idx + grid_span))
-                        )
-                        row_span = int(cell._tc.attrib.get('rowSpan', '1'))
-                        total_row_height = sum(
-                            shape.table.rows[r].height.pt 
-                            for r in range(r_idx, min(len(shape.table.rows), r_idx + row_span))
-                        )
-                        
-                        containers_list.append({
-                            'tf': cell.text_frame,
-                            'box_width': total_col_width,
-                            'box_height': total_row_height,
-                            'paragraphs': valid_paras
-                        })
-        elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-            for sub in shape.shapes:
-                _extract_from_shape(sub)
-
-    for slide in prs.slides:
-        for s in slide.shapes: _extract_from_shape(s)
-        if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-            merge_continuation_paragraphs_in_textbox(slide.notes_slide.notes_text_frame)
-            valid_paras = [p for p in slide.notes_slide.notes_text_frame.paragraphs if not p._element.xpath('.//a:fld') and p.text.strip()]
-            if valid_paras:
-                containers_list.append({
-                    'tf': slide.notes_slide.notes_text_frame,
-                    'box_width': 500.0,
-                    'box_height': 200.0,
-                    'paragraphs': valid_paras
-                })
-
-    for master in prs.slide_masters:
-        for s in master.shapes: _extract_from_shape(s)
-        for l in master.slide_layouts:
-            for s in l.shapes: _extract_from_shape(s)
-
-    return containers_list
-
-# --- TRAITEMENT DES BATCHS PARALLÈLES ---
-
-def _process_unique_batch(args):
-    """Traite un lot de textes uniques avec verrouillage absolu de la langue cible."""
-    batch_idx, batch_texts, glossary_snippet, direction = args
-    
-    batch_in_tokens, batch_out_tokens = 0, 0
-    formatted_glossary = f"\n\n--- GLOSSAIRE À RESPECTER IMPÉRATIVEMENT ---\n{glossary_snippet}\n" if glossary_snippet else ""
-    
-    if direction == "Français ➔ Allemand":
-        ex_source, ex_cible = "SPM 4440", "Filiale 4440"
-        target_lang_instruction = (
-            "1. LANGUE CIBLE EXCLUSIVE : ALLEMAND. Le document final doit être INTÉGRALEMENT en ALLEMAND.\n"
-            "   - TITRES HYBRIDES OU PARTIELLEMENT EN ALLEMAND : Si un titre contient un préfixe allemand (ex: 'Wochenkennzahlen | ') "
-            "mais se poursuit avec du français (ex: 'EM avec marge négative', 'Poisson', 'Sec'), conserve impérativement le préfixe allemand intact "
-            "('Wochenkennzahlen | ') et traduis la partie française vers l'allemand ('EM mit negativer Marge', 'Fisch', 'Troso'). Ne traduis JAMAIS vers le français !\n"
-            "   - Si une phrase ou un titre d'origine est DÉJÀ 100% en allemand (ex: 'Wochenkennzahlen | Online Wochenperformance'), "
-            "CONSERVE-LE STRICTEMENT EN ALLEMAND TEL QUEL ! Ne le traduis JAMAIS vers le français !"
-        )
-        grammar_instruction = "9. GRAMMAIRE : Respecte la grammaire allemande, les déclinaisons et les majuscules aux substantifs."
-    else:
-        ex_source, ex_cible = "Filiale 4440", "SPM 4440"
-        target_lang_instruction = (
-            "1. LANGUE CIBLE EXCLUSIVE : FRANÇAIS. Le document final doit être INTÉGRALEMENT en FRANÇAIS.\n"
-            "   - RÈGLE CRITIQUE D'IDEMPOTENCE : Si une phrase d'origine est DÉJÀ en français, conserve-la strictement en français !"
-        )
-        grammar_instruction = "9. GRAMMAIRE : Réalise toutes les contractions nécessaires en français ('auprès des', 'du')."
-
-    extra_rules = (
-        "\n\n--- CONSIGNES DE STYLE ET DE STRUCTURE ---\n"
-        f"{target_lang_instruction}\n"
-        "2. BALISES STRICTES : Conserve impérativement toutes les balises <r id=\"...\" st=\"...\">...</r> et <br/>.\n"
-        "3. LOCALISATION DU TEXTE : Traduis uniquement le contenu situé À L'INTÉRIEUR des balises sans déplacer les balises ni les fusionner.\n"
-        "4. RETOURS À LA LIGNE (<br/>) : Conserve la balise <br/> uniquement si elle est déjà présente dans le texte d'origine.\n"
-        "5. STYLE FLUIDE ET CONTINU : Dans les phrases et puces, NE METS AUCUN retour forcé (\\n). Laisse la phrase s'enchaîner naturellement.\n"
-        "6. RESPECT DE LA GRAISSE (GRAS) : Ne mets JAMAIS en gras un texte qui n'était pas en gras à l'origine.\n"
-        "7. CONCISION POUR LES ENCADRÉS : Dans les encadrés d'analyse, reste direct. Conserve 'dv.' si la source utilise 'dv.'.\n"
-        f"8. PRIORITÉ AU GLOSSAIRE : Applique systématiquement les équivalences (ex: '{ex_source}' ➔ '{ex_cible}').\n"
-        f"{grammar_instruction}"
-    )
-    combined_context = formatted_glossary + extra_rules
-
-    prompt = build_prompt(batch_texts, combined_context, direction=direction, is_batch=True)
-    ai_translations, in_tok, out_tok = call_gemini_batch(prompt, expected_count=len(batch_texts))
-    batch_in_tokens += in_tok
-    batch_out_tokens += out_tok
-
-    results = []
-    if ai_translations:
-        for orig, trans in zip(batch_texts, ai_translations):
-            results.append((orig, sanitize_pptx_translation(orig, trans, direction=direction)))
-        return batch_idx, results, batch_in_tokens, batch_out_tokens
-
-    for orig in batch_texts:
-        fb_prompt = build_prompt(orig, combined_context, direction=direction, is_batch=False)
-        fb_trans, fb_in, fb_out = call_gemini_fallback(fb_prompt)
-        batch_in_tokens += fb_in
-        batch_out_tokens += fb_out
-        results.append((orig, sanitize_pptx_translation(orig, fb_trans, direction=direction) if fb_trans else orig))
-        
-    return batch_idx, results, batch_in_tokens, batch_out_tokens
-
-# --- FONCTION PRINCIPALE ---
-
-def translate_pptx_universal(input_path: str, output_path: str, glossary_path: str = None, progress_callback=None, direction="Allemand ➔ Français"):
+def translate_pptx_universal(input_path: str, output_path: str, glossary_path: str = None,
+                             progress_callback=None, direction="Allemand ➔ Français"):
     start_time = time.time()
-    total_input_tokens, total_output_tokens = 0, 0
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    tmp_in = f"/tmp/in_{os.path.basename(input_path)}"
-    tmp_out = f"/tmp/out_{os.path.basename(input_path)}"
-    
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    # Dossier de travail propre a cet appel : deux traductions simultanees
+    # d'un fichier du meme nom ne doivent pas partager leurs copies.
+    work = tempfile.mkdtemp(prefix="traduction_")
+    ext = os.path.splitext(input_path)[1]
+    tmp_in = os.path.join(work, "in" + ext)
+    tmp_out = os.path.join(work, "out" + ext)
     shutil.copy(input_path, tmp_in)
+
+    tgt_lang = LANG[direction][1]
     prs = Presentation(tmp_in)
     glossary_df = load_glossary_df(glossary_path)
 
-    containers_data = extract_all_pptx_containers(prs, direction=direction)
-    all_paragraphs = [p for c in containers_data for p in c['paragraphs']]
-    
-    if not all_paragraphs:
-        prs.save(tmp_out)
-        shutil.copy(tmp_out, output_path)
-        os.remove(tmp_in); os.remove(tmp_out)
-        return {"status": "success", "output_path": output_path, "time_seconds": 0, "input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0}
+    inv = Inventory(prs)
+    inv.collect()
 
-    serialized_texts = [serialize_paragraph_runs(p) for p in all_paragraphs]
+    # Un segment par paragraphe contenant du texte.
+    segments, contexts, owners = [], [], []
+    for b in inv.bodies:
+        pi = 0
+        while pi < len(b.paras):
+            group = [pi]
+            while group[-1] + 1 < len(b.paras) and is_continuation(b.paras[group[-1]], b.paras[group[-1] + 1], b):
+                group.append(group[-1] + 1)
+            if len(group) > 1:
+                seg = group_segment([b.paras[k] for k in group])
+            else:
+                seg = paragraph_segment(b.paras[pi])
+            if seg is not None:
+                b.seg_index[pi] = len(segments)
+                for k in group[1:]:
+                    b.merged.add(k)
+                segments.append(seg)
+                contexts.append(b.context)
+                owners.append(b)
+            pi = group[-1] + 1
+    n_para = len(segments)
+    chart_values = chart_value_segments(prs)
+    segments += chart_values
+    contexts += ["libellé de graphique"] * len(chart_values)
 
-    translation_cache = {}
-    unique_texts_to_call = []
+    # Texte d'origine, releve AVANT toute ecriture, pour la mesure.
+    orig = {id(b): [original_runs(p) for p in b.paras] for b in inv.bodies}
 
-    for orig_txt in serialized_texts:
-        if orig_txt in translation_cache:
+    results, stats = translate_segments(segments, direction, "pptx", glossary_df,
+                                        progress_callback, contexts)
+
+    # Mesure : a quelle echelle chaque corps traduit tient-il ?
+    report = {"shrunk": 0, "grown": 0, "shortened": 0, "overflow": 0, "table_grown": 0}
+    plans = {}
+    for b in inv.bodies:
+        if b.kind not in ("shape", "cell") or not b.width or not b.height or _vertical(b):
             continue
-        
-        clean_txt = re.sub(r'<[^>]+>', '', orig_txt).strip()
-        if not clean_txt:
-            translation_cache[orig_txt] = orig_txt
+        if not any(results[i] is not None for i in b.seg_index.values()):
             continue
-
-        override = check_manual_override(orig_txt)
-        if override and direction == "Allemand ➔ Français":
-            translation_cache[orig_txt] = override
+        kind, el = b.chain.autofit()
+        start = 1.0
+        if kind == "normAutofit" and el is not None and el.get("fontScale"):
+            start = int(el.get("fontScale")) / 100000.0
+        try:
+            extra = _extra_room(b)
+            s = needed_scale(b, orig[id(b)], _runs_for(b, segments, results, orig[id(b)]),
+                             start, extra)
+        except Exception as exc:
+            print(f"⚠️ Mesure impossible ({b.context}) : {exc}")
             continue
+        plans[id(b)] = [b, start, s, extra]
 
-        if is_untranslatable_text(clean_txt):
-            translation_cache[orig_txt] = orig_txt
+    # Tableaux : PowerPoint agrandit les lignes trop pleines. Si la place
+    # est libre sous le tableau, on le laisse grandir plutot que de reduire
+    # le texte.
+    by_table = {}
+    for plan in plans.values():
+        if plan[0].kind == "cell":
+            by_table.setdefault(id(plan[0].shape), []).append(plan)
+    for cell_plans in by_table.values():
+        if all(pl[2] is not None and pl[2] >= pl[1] - 1e-9 for pl in cell_plans):
             continue
+        grow, grown_before = {}, {}
+        for b, start, s, _ in cell_plans:
+            new_runs = _runs_for(b, segments, results, orig[id(b)])
+            row = b.cell[0]
+            grow[row] = max(grow.get(row, 0.0), overflow_at(b, orig[id(b)], new_runs, start))
+            # Lignes deja plus hautes que prevu dans l'original.
+            h_o, _, _, (_, avail_h, _) = _body_layout(b, orig[id(b)], start)
+            grown_before[row] = max(grown_before.get(row, 0.0), h_o - avail_h)
+        below, _ = _free_space(cell_plans[0][0])
+        if sum(grow.values()) <= below - sum(max(0.0, v) for v in grown_before.values()):
+            for pl in cell_plans:
+                pl[2] = pl[1]
+            report["table_grown"] += 1
 
-        if is_already_in_target_language(clean_txt, direction):
-            translation_cache[orig_txt] = orig_txt
+    # Versions courtes pour ce qui devrait etre trop reduit.
+    to_shorten = []
+    for b, start, s, extra in plans.values():
+        if s is not None and s >= start * SHORTEN_BELOW:
             continue
+        ratio = (s or MIN_SCALE) / start
+        for i in b.seg_index.values():
+            if results[i] is None:
+                continue
+            txt = items_to_tagged(segments[i], results[i])
+            plain = re.sub(r"<[^>]+>", "", txt)
+            if len(plain) > 12:
+                to_shorten.append((i, segments[i], txt, max(6, int(len(plain) * ratio * ratio))))
+    if to_shorten:
+        print(f"✂️ {len(to_shorten)} textes trop longs pour leur cadre : demande de versions courtes")
+        for k in range(0, len(to_shorten), 40):
+            short, i_tok, o_tok = shorten_segments(to_shorten[k:k + 40], direction)
+            stats["input_tokens"] += i_tok
+            stats["output_tokens"] += o_tok
+            for i, items in short.items():
+                b = owners[i]
+                plan = plans.get(id(b))
+                if plan is None:
+                    continue
+                old = results[i]
+                results[i] = items
+                s2 = needed_scale(b, orig[id(b)], _runs_for(b, segments, results, orig[id(b)]),
+                                  plan[1], plan[3])
+                # La version courte n'est gardee que si elle tient mieux.
+                if (s2 or 0) + 1e-9 > (plan[2] or 0):
+                    plan[2] = s2
+                    report["shortened"] += 1
+                else:
+                    results[i] = old
 
-        unique_texts_to_call.append(orig_txt)
+    # Ecriture du texte.
+    for seg, items in zip(segments[:n_para], results[:n_para]):
+        if items is not None:
+            rebuild_paragraph(seg, items, tgt_lang)
+    for seg, items in zip(segments[n_para:], results[n_para:]):
+        if items is not None:
+            seg.meta["v"].text = "".join(it[2] for it in items if it[0] == "t")
+    for part, root in inv.blob_parts:
+        part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
-    batch_size = 30
-    total_unique = len(unique_texts_to_call)
-    batch_args_list = []
-
-    for i in range(0, total_unique, batch_size):
-        batch = unique_texts_to_call[i:i + batch_size]
-        batch_sample = " ".join([re.sub(r'<[^>]+>', '', t) for t in batch])
-        glossary_snippet = get_matching_glossary_rules(batch_sample, glossary_df, direction=direction)
-        batch_args_list.append((i // batch_size, batch, glossary_snippet, direction))
-
-    total_batches = len(batch_args_list)
-    completed_batches = 0
-    max_workers = min(10, max(1, total_batches))
-
-    if total_batches > 0:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for future in as_completed([executor.submit(_process_unique_batch, arg) for arg in batch_args_list]):
-                idx, results, batch_in, batch_out = future.result()
-                total_input_tokens += batch_in
-                total_output_tokens += batch_out
-                
-                for orig, trans in results:
-                    translation_cache[orig] = trans
-                    
-                completed_batches += 1
-                if progress_callback:
-                    progress_callback(completed_batches, total_batches)
-
-    # Réinjection précise conteneur par conteneur
-    p_index = 0
-    for container in containers_data:
-        box_w = container['box_width']
-        box_h = container['box_height']
-        paras = container['paragraphs']
-
-        paras_info = []
-        container_trans_texts = []
-        for p in paras:
-            orig_txt = serialized_texts[p_index]
-            p_index += 1
-            t_text = translation_cache.get(orig_txt, orig_txt)
-            container_trans_texts.append(t_text)
-
-            clean_t = re.sub(r'<[^>]+>', '', t_text).strip()
-            base_sz = get_paragraph_base_size(p)
-            orig_raw = "".join(r.text for r in p.runs if r.text).strip()
-            is_title = (base_sz is None or base_sz > 18.0 or (len(orig_raw) < 40 and p.level == 0 and not orig_raw.startswith(('-', '•', '–', '*', '>'))))
-
-            paras_info.append({
-                'text': clean_t,
-                'base_size': base_sz,
-                'is_title': is_title
-            })
-
-        optimal_scale = calculate_optimal_container_scale(paras_info, box_w, box_h)
-
-        for p, t_text in zip(paras, container_trans_texts):
-            deserialize_paragraph_runs(p, t_text, container_scale=optimal_scale)
+    # Ajustement des cadres qui ne tiennent plus.
+    for b, start, s, extra in plans.values():
+        if s is not None and s >= start - 1e-9:
+            continue
+        kind, _ = b.chain.autofit()
+        if b.kind == "shape" and kind == "spAutoFit":
+            # Forme "ajuster a la taille du texte" : PowerPoint l'agrandirait.
+            # On le fait si la place est libre en dessous.
+            h_new, _, _, (_, avail_h, _) = _body_layout(
+                b, _runs_for(b, segments, results, orig[id(b)]), start, WIDTH_SAFETY)
+            need = h_new - avail_h + 1.0
+            below, _ = _free_space(b)
+            if 0 < need <= below:
+                b.shape.height = int(b.shape.height + need * EMU_PER_PT)
+                report["grown"] += 1
+                continue
+        if s is None:
+            report["overflow"] += 1
+        final = s if s is not None else MIN_SCALE
+        own_bp = b.txBody.find(A + "bodyPr")
+        if own_bp is not None and own_bp.find(A + "normAutofit") is not None:
+            apply_scale(b, final)
+        else:
+            apply_scale(b, final / start)
+        report["shrunk"] += 1
 
     prs.save(tmp_out)
     shutil.copy(tmp_out, output_path)
-    os.remove(tmp_in); os.remove(tmp_out)
-    
+    shutil.rmtree(work, ignore_errors=True)
+
+    print(f"📐 Ajustement : {report['shrunk']} cadres réduits, {report['grown']} agrandis, "
+          f"{report['table_grown']} tableaux agrandis, "
+          f"{report['shortened']} textes raccourcis, {report['overflow']} encore trop longs")
+    print(f"🔤 Segments : {stats['segments']}, envoyés : {stats['segments'] - stats['skipped']}, "
+          f"redemandés : {stats['retried']}, sans styles locaux : {stats['fallback']}")
     return {
         "status": "success",
         "output_path": output_path,
         "time_seconds": round(time.time() - start_time, 2),
-        "input_tokens": total_input_tokens,
-        "output_tokens": total_output_tokens,
-        "total_cost_usd": ((total_input_tokens / 1_000_000) * 0.075) + ((total_output_tokens / 1_000_000) * 0.30)
+        "input_tokens": stats["input_tokens"],
+        "output_tokens": stats["output_tokens"],
+        "total_cost_usd": stats["input_tokens"] / 1e6 * PRICE_IN + stats["output_tokens"] / 1e6 * PRICE_OUT,
+        "fit": report,
     }

@@ -72,6 +72,9 @@ if uploaded_files and st.button("Lancer la traduction", type="primary"):
                 # Nettoyage de la barre de progression à la fin
                 my_bar.empty()
 
+                if bilan.get("status") != "success" or not bilan.get("output_path"):
+                    raise RuntimeError(bilan.get("error_message", "traduction impossible"))
+
                 with open(bilan["output_path"], "rb") as f:
                     translated_data = f.read()
 

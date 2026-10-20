@@ -122,6 +122,15 @@ REGLES ABSOLUES
 
 9. Un retour a la ligne \\n dans la source est voulu (titre sur deux
    lignes, element de liste) : conserve-le au meme endroit du sens.
+
+10. Un texte deja en {target} est recopie a l'identique. Un segment qui
+    melange les langues : ne traduis que la partie en {source}. Le texte
+    dans une autre langue (souvent l'anglais) reste tel quel.
+
+11. Codes, identifiants et references restent intacts, meme s'ils
+    contiennent un mot traduisible (RG18, WBF4.c, L_FR_Logistik, KW42).
+    Une reference de magasin suit l'usage de la langue cible : « Filiale
+    4440 » en allemand, « SPM 4440 » en francais.
 """
 
 USER = """Document : {name}
@@ -207,6 +216,15 @@ MAX_RETRIES = 5
 BASE_DELAY = 12.0
 
 
+TOKENS = {"input": 0, "output": 0}
+
+
+def _count_tokens(resp):
+    um = getattr(resp, "usage_metadata", None)
+    TOKENS["input"] += getattr(um, "prompt_token_count", 0) or 0
+    TOKENS["output"] += getattr(um, "candidates_token_count", 0) or 0
+
+
 def _is_transient(exc):
     text = str(exc)
     return any(s in text for s in RETRY_STATUS)
@@ -230,7 +248,15 @@ def _call(client, model, system, user, log=print):
         try:
             resp = client.models.generate_content(
                 model=model, contents=user, config=config)
+            _count_tokens(resp)
             return json.loads(resp.text)
+        except ValueError as exc:
+            # JSON invalide (reponse tronquee ou mal formee) : une nouvelle
+            # tentative, puis on le traite comme un lot desaligne, que
+            # l'appelant redecoupe au lieu d'abandonner le document.
+            last = exc
+            if attempt >= 1:
+                raise AlignmentError("reponse JSON invalide : %s" % exc)
         except Exception as exc:
             last = exc
             if not _is_transient(exc) or attempt == MAX_RETRIES - 1:
@@ -416,9 +442,12 @@ SHORTEN_SYSTEM = """Tu es traducteur professionnel, langue cible : {target}.
 Chaque segment recu est une traduction deja faite qui ne tient pas dans
 son emplacement. Propose une version plus courte, d'au plus "max"
 caracteres (balises non comptees), avec le meme sens et le meme registre.
-Prefere les termes courts et les tournures nominales ; n'abrege pas avec
-des points sauf si c'est l'usage. Garde exactement les balises <s1>...</s1>,
-les variables {{...}} et %s, les nombres et les unites. Respecte la casse
+Prefere les termes courts et les tournures nominales. N'introduis aucun
+sigle ni aucune abreviation absents du texte (pas de « DG », pas de
+« struct. ») ; n'abrege avec un point que si c'est l'usage courant. Garde exactement les balises <s1>...</s1>,
+les variables {{...}} et %s, les nombres et les unites. Ne supprime aucune
+information : ni date, ni jour, ni mention entre parentheses, ni passage
+balise ; raccourcis la formulation, pas le contenu. Respecte la casse
 du debut. Renvoie un objet par segment, avec le meme identifiant."""
 
 
@@ -435,8 +464,14 @@ def shorten(items, target, project, location, model=DEFAULT_MODEL,
     client = _client(project, location)
     payload = [{"id": uid, "ou": ctx, "max": n, "texte": txt}
                for uid, txt, n, ctx in items]
-    data = _call(client, model, SHORTEN_SYSTEM.format(target=target),
-                 json.dumps(payload, ensure_ascii=False, indent=1), log=log)
+    try:
+        data = _call(client, model, SHORTEN_SYSTEM.format(target=target),
+                     json.dumps(payload, ensure_ascii=False, indent=1), log=log)
+    except Exception as exc:
+        # Les versions courtes sont un plus : en cas d'echec, on garde les
+        # traductions completes (reduites a l'ecriture si besoin).
+        log("    raccourcissement impossible (%s) : traductions completes gardees" % exc)
+        return {}
     wanted = {uid for uid, _, _, _ in items}
     return {row["id"]: row["texte"] for row in data
             if isinstance(row, dict) and row.get("id") in wanted
@@ -480,6 +515,7 @@ def transcribe_images(items, project, location, model=DEFAULT_MODEL,
             try:
                 resp = client.models.generate_content(
                     model=model, contents=parts, config=config)
+                _count_tokens(resp)
                 break
             except Exception as exc:
                 if not _is_transient(exc) or attempt == MAX_RETRIES - 1:
@@ -487,7 +523,12 @@ def transcribe_images(items, project, location, model=DEFAULT_MODEL,
                 import time
                 time.sleep(BASE_DELAY * (2 ** attempt))
         wanted = {uid for uid, _ in batch}
-        for row in json.loads(resp.text):
+        try:
+            rows = json.loads(resp.text)
+        except ValueError:
+            log("    lecture visuelle : reponse illisible, zones laissees telles quelles")
+            continue
+        for row in rows:
             if isinstance(row, dict) and row.get("id") in wanted:
                 out[row["id"]] = (row.get("texte") or "").strip()
     log("    lecture visuelle : %d zones transcrites" % len(out))

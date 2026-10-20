@@ -1,235 +1,325 @@
+"""
+Traduction XLSX / XLSM en gardant tout le classeur intact.
+
+openpyxl reecrit le classeur entier et perd au passage ce qu'il ne connait
+pas : images, graphiques, formes, certains formats conditionnels. Ici on
+ne modifie que les parties XML qui contiennent du texte, et on recopie
+tout le reste octet pour octet :
+
+  - textes des cellules (xl/sharedStrings.xml et chaines en ligne), y
+    compris le texte riche : chaque morceau garde sa police, sa couleur,
+    son gras (segments balises, voir core/segments.py) ;
+  - commentaires ;
+  - zones de texte et formes (xl/drawings) ;
+  - titres et libelles des graphiques (xl/charts).
+
+Ne sont pas traduits : formules, noms de feuilles (les formules y font
+reference), et tout texte utilise comme valeur dans une formule
+(=NB.SI(A:A;"Ja") cesserait de compter si "Ja" devenait "Oui").
+"""
+import copy
 import os
-import shutil
-import time
 import re
-import openpyxl
-from openpyxl.cell.rich_text import CellRichText, TextBlock
-from openpyxl.cell.text import InlineFont
-from openpyxl.styles.colors import Color
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import tempfile
+import time
+import zipfile
 
-from core.translation_api import call_gemini_batch, call_gemini_fallback, build_prompt
-from core.text_utils import load_glossary_df, get_matching_glossary_rules
+from lxml import etree
 
-def cell_to_tagged_text(cell):
-    """Convertit une cellule Excel en texte avec balises HTML si elle contient du Rich Text."""
-    val = cell.value
-    if val is None:
-        return ""
-        
-    if type(val).__name__ == 'CellRichText':
-        tagged_str = ""
-        for element in val:
-            if isinstance(element, str):
-                tagged_str += element
-            else: # C'est un TextBlock (texte avec style spécifique)
-                txt = element.text
-                f = element.font
-                if not txt: continue
-                
-                is_b = f.b
-                is_i = f.i
-                is_u = f.u
-                is_s = f.strike
-                
-                # Extraction sécurisée de la couleur RGB
-                c_rgb = None
-                if f.color:
-                    try:
-                        if hasattr(f.color, 'rgb') and isinstance(f.color.rgb, str) and f.color.rgb != "00000000":
-                            c_rgb = f.color.rgb
-                    except Exception:
-                        pass
-                
-                # Application des balises autour du segment de texte
-                if c_rgb: txt = f'<c c="{c_rgb}">{txt}</c>'
-                if is_s: txt = f"<s>{txt}</s>"
-                if is_u: txt = f"<u>{txt}</u>"
-                if is_i: txt = f"<i>{txt}</i>"
-                if is_b: txt = f"<b>{txt}</b>"
-                
-                tagged_str += txt
-        return tagged_str
-        
-    elif isinstance(val, str):
-        return val
-        
-    return str(val)
+from core.segments import Segment
+from core.text_utils import load_glossary_df
+from core.translation_api import LANG, PRICE_IN, PRICE_OUT, translate_segments
 
-def tagged_text_to_rich_text(tagged_text):
-    """Reconvertit un texte balisé en objet CellRichText compréhensible par Excel."""
-    # Si aucune balise n'est trouvée, on renvoie un texte simple (préserve le style global de la cellule)
-    if not re.search(r'<(/?[bius]|c c="[^"]+")>', tagged_text):
-        return tagged_text 
-        
-    parts = re.split(r'(</?(?:b|i|u|s)>|<c c="[^"]+">|</c>)', tagged_text)
-    rich_text = CellRichText()
-    
-    curr_b, curr_i, curr_u, curr_s, curr_c = False, False, False, False, None
-    
-    for part in parts:
-        if not part: continue
-        
-        if part == '<b>': curr_b = True
-        elif part == '</b>': curr_b = False
-        elif part == '<i>': curr_i = True
-        elif part == '</i>': curr_i = False
-        elif part == '<u>': curr_u = True
-        elif part == '</u>': curr_u = False
-        elif part == '<s>': curr_s = True
-        elif part == '</s>': curr_s = False
-        elif part.startswith('<c c="'):
-            m = re.match(r'<c c="([^"]+)">', part)
-            if m: curr_c = m.group(1)
-        elif part == '</c>':
-            curr_c = None
-        else:
-            # Construction du bloc de texte avec son style en cours
-            font = InlineFont(b=curr_b, i=curr_i, u='single' if curr_u else None, strike=curr_s)
-            if curr_c:
-                font.color = Color(rgb=curr_c)
-            rich_text.append(TextBlock(font, part))
-            
-    return rich_text if len(rich_text) > 0 else tagged_text
+S_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+S = "{%s}" % S_NS
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+C = "{http://schemas.openxmlformats.org/drawingml/2006/chart}"
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
-def extract_texts_from_excel(wb):
-    """Extrait les textes et le balisage des cellules."""
-    cells_data = []
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                val = cell.value
-                if val and (isinstance(val, str) or type(val).__name__ == 'CellRichText'):
-                    # Ignorer les formules
-                    if isinstance(val, str) and val.startswith('='):
-                        continue
-                    
-                    tagged = cell_to_tagged_text(cell).strip()
-                    if tagged:
-                        cells_data.append((ws.title, cell.row, cell.column, tagged))
-    return cells_data
 
-def _process_single_batch(args):
-    """Traite un lot Excel et renvoie les traductions."""
-    batch_idx, batch_cells, glossary_snippet, direction = args
-    orig_texts = [cell[3] for cell in batch_cells]
-    
-    extra_rules = (
-        "\n\nCONSIGNES DE STYLE EXCEL ET BALISAGE :\n"
-        "1. PRIORITÉ ABSOLUE AU GLOSSAIRE : Applique strictement les traductions du glossaire.\n"
-        "2. CONSERVE TOUTES LES BALISES STRUCTURALES : <b>, <i>, <u>, <s> et <c c=\"...\">.\n"
-        "3. MOTS ISOLÉS COLORÉS : Si une phrase a une balise de couleur (ex: <c c=\"FFFFC000\">texte</c>), entoure son équivalent traduit avec EXACTEMENT la même balise.\n"
-        "4. CONCISION : Les textes de cellules doivent rester courts."
-    )
-    combined_context = (glossary_snippet or "") + extra_rules
+def _style_key(rpr):
+    return "-" if rpr is None else etree.tostring(rpr, encoding="unicode")
 
-    prompt = build_prompt(orig_texts, combined_context, direction=direction, is_batch=True)
-    
-    batch_in_tokens = 0
-    batch_out_tokens = 0
 
-    translations, in_tok, out_tok = call_gemini_batch(prompt, expected_count=len(batch_cells))
-    batch_in_tokens += in_tok
-    batch_out_tokens += out_tok
+def string_item_segment(si):
+    """Segment pour un <si> (chaine partagee), un <is> (chaine en ligne) ou
+    le <text> d'un commentaire."""
+    seg = Segment()
+    seg.meta["si"] = si
+    runs = si.findall(S + "r")
+    if runs:
+        seg.meta["rich"] = True
+        for r in runs:
+            t = r.find(S + "t")
+            rpr = r.find(S + "rPr")
+            text = t.text if t is not None and t.text else ""
+            for k, part in enumerate(text.split("\n")):
+                if k:
+                    seg.add_break("br")
+                seg.add_text(part, _style_key(rpr), rpr)
+    else:
+        t = si.find(S + "t")
+        text = t.text if t is not None and t.text else ""
+        for k, part in enumerate(text.split("\n")):
+            if k:
+                seg.add_break("br")
+            seg.add_text(part, "-", None)
+    return seg if seg.has_text() else None
 
-    if translations:
-        return batch_idx, batch_cells, translations, orig_texts, batch_in_tokens, batch_out_tokens
 
-    # Mode secours unitaire
-    print(f"⚠️ Lot Excel {batch_idx + 1} : Bascule en mode de secours unitaire...")
-    fallback_translated = []
-    
-    for orig_txt in orig_texts:
-        fb_prompt = build_prompt(orig_txt, combined_context, direction=direction, is_batch=False)
-        fb_trans, fb_in, fb_out = call_gemini_fallback(fb_prompt)
-        
-        batch_in_tokens += fb_in
-        batch_out_tokens += fb_out
-        
-        if fb_trans:
-            fallback_translated.append(fb_trans)
-        else:
-            fallback_translated.append(orig_txt)
-            
-    return batch_idx, batch_cells, fallback_translated, orig_texts, batch_in_tokens, batch_out_tokens
+def rebuild_string_item(seg, items):
+    si = seg.meta["si"]
+    keep = [c for c in si if c.tag not in (S + "t", S + "r")]   # rPh, phoneticPr
+    for c in list(si):
+        si.remove(c)
 
-def translate_xlsx_universal(input_path: str, output_path: str, glossary_path: str = None, progress_callback=None, direction="Allemand ➔ Français"):
+    # Retours a la ligne : caractere \n dans le texte, comme Excel.
+    pieces = []     # (style_id, texte)
+    for it in items:
+        if it[0] == "t":
+            if pieces and pieces[-1][0] == it[1]:
+                pieces[-1] = (it[1], pieces[-1][1] + it[2])
+            else:
+                pieces.append((it[1], it[2]))
+        elif it[0] in ("br", "p"):
+            sid = pieces[-1][0] if pieces else seg.base_style()
+            pieces.append((sid, "\n"))
+        elif it[0] == "tab":
+            sid = pieces[-1][0] if pieces else seg.base_style()
+            pieces.append((sid, "\t"))
+
+    def t_el(text):
+        t = etree.Element(S + "t")
+        t.text = text
+        if text != text.strip() or "\n" in text:
+            t.set(XML_SPACE, "preserve")
+        return t
+
+    if not seg.meta.get("rich"):
+        si.insert(0, t_el("".join(p[1] for p in pieces)))
+    else:
+        for k, (sid, text) in enumerate(pieces):
+            r = etree.Element(S + "r")
+            rpr = seg.styles.get(sid)
+            if rpr is not None:
+                r.append(copy.deepcopy(rpr))
+            r.append(t_el(text))
+            si.insert(k, r)
+    for c in keep:
+        si.append(c)
+
+
+def part_types(z):
+    """Type de contenu de chaque partie, d'apres [Content_Types].xml."""
+    root = etree.fromstring(z.read("[Content_Types].xml"))
+    ns = "{http://schemas.openxmlformats.org/package/2006/content-types}"
+    defaults = {d.get("Extension").lower(): d.get("ContentType") for d in root.findall(ns + "Default")}
+    out = {}
+    for n in z.namelist():
+        out[n] = defaults.get(n.rsplit(".", 1)[-1].lower(), "")
+    for o in root.findall(ns + "Override"):
+        out[o.get("PartName").lstrip("/")] = o.get("ContentType")
+    return out
+
+
+_FORMULA_STR = re.compile(r'"((?:[^"]|"")*)"')
+
+
+_REF_RE = re.compile(r"(?:(?:'((?:[^']|'')+)'|([A-Za-z0-9_.]+))!)?"
+                     r"\$?([A-Z]{1,3})\$?(\d+)?(?::\$?([A-Z]{1,3})\$?(\d+)?)?")
+
+
+def _col_num(col):
+    n = 0
+    for ch in col:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def sheet_names_by_part(z):
+    """Partie XML de chaque feuille -> nom de la feuille."""
+    wb = etree.fromstring(z.read("xl/workbook.xml"))
+    rels = etree.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+    rid_target = {r.get("Id"): r.get("Target") for r in rels}
+    out = {}
+    for sh in wb.iter(S + "sheet"):
+        rid = sh.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        target = rid_target.get(rid, "")
+        path = target.lstrip("/") if target.startswith("/") else "xl/" + target
+        out[path] = sh.get("name")
+    return out
+
+
+def formula_protection(z, sheet_parts):
+    """Textes et cellules a ne pas traduire a cause des formules.
+
+    Une formule qui contient du texte ("Ja") compare des cellules a ce
+    texte : traduire l'un sans l'autre fausse le calcul. On protege donc
+    les chaines litterales des formules ET toutes les cellules des plages
+    lues par ces formules (=NB.SI(C2:C5;"Ja") protege C2:C5).
+
+    Renvoie (chaines protegees, {nom de feuille: [(col1, lig1, col2, lig2)]}).
+    """
+    literals, ranges = set(), {}
+    names = sheet_names_by_part(z)
+    for n in sheet_parts:
+        here = names.get(n)
+        x = z.read(n).decode("utf8", "ignore")
+        for f in re.findall(r"<f[^>]*>([^<]*)</f>", x):
+            f = f.replace("&quot;", '"').replace("&amp;", "&").replace("&apos;", "'")
+            lits = _FORMULA_STR.findall(f)
+            if not lits:
+                continue
+            for m in lits:
+                if m.strip():
+                    literals.add(m.replace('""', '"').strip())
+            body = _FORMULA_STR.sub('""', f)
+            for m in _REF_RE.finditer(body):
+                sheet = (m.group(1) or "").replace("''", "'") or m.group(2) or here
+                c1, r1, c2, r2 = m.group(3), m.group(4), m.group(5), m.group(6)
+                if not r1 and not c2:
+                    continue        # mot isole (nom de fonction), pas une reference
+                col1 = _col_num(c1)
+                col2 = _col_num(c2) if c2 else col1
+                row1 = int(r1) if r1 else 1
+                row2 = int(r2) if r2 else (row1 if r1 and not c2 else 1048576)
+                ranges.setdefault(sheet, []).append((col1, row1, col2, row2))
+    return literals, ranges
+
+
+def _in_ranges(ref, ranges):
+    m = re.match(r"([A-Z]+)(\d+)$", ref or "")
+    if not m:
+        return False
+    col, row = _col_num(m.group(1)), int(m.group(2))
+    return any(c1 <= col <= c2 and r1 <= row <= r2 for c1, r1, c2, r2 in ranges)
+
+
+def translate_xlsx_universal(input_path: str, output_path: str, glossary_path: str = None,
+                             progress_callback=None, direction="Allemand ➔ Français"):
     start_time = time.time()
-    total_input_tokens = 0
-    total_output_tokens = 0
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    tmp_in = f"/tmp/in_{os.path.basename(input_path)}"
-    tmp_out = f"/tmp/out_{os.path.basename(input_path)}"
-    
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    # Dossier de travail propre a cet appel : deux traductions simultanees
+    # d'un fichier du meme nom ne doivent pas partager leurs copies.
+    work = tempfile.mkdtemp(prefix="traduction_")
+    ext = os.path.splitext(input_path)[1]
+    tmp_in = os.path.join(work, "in" + ext)
+    tmp_out = os.path.join(work, "out" + ext)
     shutil.copy(input_path, tmp_in)
-    
-    # Chargement du classeur en demandant explicitement de lire le Rich Text
-    keep_vba = tmp_in.lower().endswith('.xlsm')
-    try:
-        wb = openpyxl.load_workbook(tmp_in, keep_vba=keep_vba, rich_text=True)
-    except TypeError:
-        # Fallback pour les anciennes versions d'openpyxl
-        wb = openpyxl.load_workbook(tmp_in, keep_vba=keep_vba)
-        
+    tgt_lang = LANG[direction][1]
     glossary_df = load_glossary_df(glossary_path)
 
-    cells_to_translate = extract_texts_from_excel(wb)
-    total_cells = len(cells_to_translate)
-    
-    batch_size, max_workers = (40, 6) if total_cells > 200 else ((20, 3) if total_cells > 40 else (10, 1))
+    from processors.pptx_processor import paragraph_segment as dml_segment
+    from processors.pptx_processor import rebuild_paragraph as dml_rebuild
 
-    batch_args_list = [] 
-    for i in range(0, total_cells, batch_size):
-        batch = cells_to_translate[i:i + batch_size]
-        batch_text = " ".join([cell[3] for cell in batch])
-        glossary_snippet = get_matching_glossary_rules(batch_text, glossary_df, direction=direction)
-        
-        batch_args_list.append((i//batch_size, batch, glossary_snippet, direction))
+    zin = zipfile.ZipFile(tmp_in)
+    names = zin.namelist()
+    types = part_types(zin)
+    sheets = [n for n in names if types.get(n, "").endswith("worksheet+xml")]
+    protected, prot_ranges = formula_protection(zin, sheets)
+    sheet_by_part = sheet_names_by_part(zin)
+    # Chaines partagees lues par une formule : index proteges.
+    protected_sst = set()
+    for n in sheets:
+        rng = prot_ranges.get(sheet_by_part.get(n))
+        if not rng:
+            continue
+        x = zin.read(n).decode("utf8", "ignore")
+        for ref, idx in re.findall(r'<c r="([A-Z]+\d+)"[^>]*t="s"[^>]*>\s*<v>(\d+)</v>', x):
+            if _in_ranges(ref, rng):
+                protected_sst.add(int(idx))
 
-    if not batch_args_list:
-        wb.save(tmp_out)
-        shutil.copy(tmp_out, output_path)
-        os.remove(tmp_in)
-        os.remove(tmp_out)
-        return {
-            "status": "success", "output_path": output_path, "time_seconds": round(time.time() - start_time, 2),
-            "input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0
-        }
+    roots = {}          # partie -> arbre XML modifie
+    segments, contexts, kinds = [], [], []
 
-    print(f"⚡ Traitement XLSX de {total_cells} cellules...")
-    total_batches = len(batch_args_list)
-    completed_batches = 0
+    def add(seg, ctx, kind):
+        if seg is None:
+            return
+        plain = seg.plain_text().strip()
+        if plain in protected:
+            return      # texte utilise par une formule : on n'y touche pas
+        segments.append(seg)
+        contexts.append(ctx)
+        kinds.append(kind)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for future in as_completed([executor.submit(_process_single_batch, arg) for arg in batch_args_list]):
-            idx, batch, translated_texts, orig_texts, batch_in, batch_out = future.result()
-            
-            total_input_tokens += batch_in
-            total_output_tokens += batch_out
-            
-            # Injection des traductions dans le classeur
-            for cell_info, t_text in zip(batch, translated_texts):
-                ws_title, row_idx, col_idx, _ = cell_info
-                ws = wb[ws_title]
-                cell = ws.cell(row=row_idx, column=col_idx)
-                
-                # Reconversion du balisage texte en objet stylisé natif
-                cell.value = tagged_text_to_rich_text(t_text)
-                
-            completed_batches += 1
-            if progress_callback:
-                progress_callback(completed_batches, total_batches)
+    for n in names:
+        ct = types.get(n, "")
+        if ct.endswith("sharedStrings+xml"):
+            root = etree.fromstring(zin.read(n))
+            roots[n] = root
+            for k, si in enumerate(root.findall(S + "si")):
+                if k not in protected_sst:
+                    add(string_item_segment(si), "cellule", "si")
+        elif n in sheets:
+            data = zin.read(n)
+            if b"inlineStr" not in data:
+                continue
+            root = etree.fromstring(data)
+            roots[n] = root
+            rng = prot_ranges.get(sheet_by_part.get(n), [])
+            for c in root.iter(S + "c"):
+                if c.get("t") == "inlineStr" and not _in_ranges(c.get("r"), rng):
+                    isel = c.find(S + "is")
+                    if isel is not None:
+                        add(string_item_segment(isel), "cellule", "si")
+        elif ct.endswith("spreadsheetml.comments+xml"):
+            root = etree.fromstring(zin.read(n))
+            roots[n] = root
+            for txt in root.iter(S + "text"):
+                add(string_item_segment(txt), "commentaire", "si")
+        elif ct.endswith("officedocument.drawing+xml") or ct.endswith("drawingml.chart+xml"):
+            root = etree.fromstring(zin.read(n))
+            roots[n] = root
+            ctx = "zone de texte" if ct.endswith("drawing+xml") and "chart" not in ct else "titre de graphique"
+            for p in root.iter(A + "p"):
+                add(dml_segment(p), ctx, "dml")
+            if ct.endswith("chart+xml"):
+                for v in root.iter(C + "v"):
+                    par = v.getparent()
+                    if par is not None and par.tag == C + "pt" and v.text \
+                            and re.search(r"[^\W\d_]", v.text):
+                        seg = Segment()
+                        seg.add_text(v.text, "-", None)
+                        seg.meta["v"] = v
+                        add(seg, "libellé de graphique", "v")
 
-    wb.save(tmp_out)
+    print(f"⚡ Traitement XLSX de {len(segments)} textes...")
+    results, stats = translate_segments(segments, direction, "xlsx", glossary_df,
+                                        progress_callback, contexts)
+
+    for seg, items, kind in zip(segments, results, kinds):
+        if items is None:
+            continue
+        if kind == "si":
+            rebuild_string_item(seg, items)
+        elif kind == "dml":
+            dml_rebuild(seg, items, tgt_lang)
+        else:
+            seg.meta["v"].text = "".join(it[2] for it in items if it[0] == "t")
+
+    # Ecriture : parties modifiees regenerees, le reste recopie tel quel.
+    with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            if info.filename in roots:
+                data = etree.tostring(roots[info.filename], xml_declaration=True,
+                                      encoding="UTF-8", standalone=True)
+            else:
+                data = zin.read(info.filename)
+            zout.writestr(info, data)
+    zin.close()
+
     shutil.copy(tmp_out, output_path)
-    os.remove(tmp_in)
-    os.remove(tmp_out)
-    
-    execution_time = time.time() - start_time
-    total_cost = ((total_input_tokens / 1_000_000) * 0.075) + ((total_output_tokens / 1_000_000) * 0.30)
+    shutil.rmtree(work, ignore_errors=True)
 
+    print(f"🔤 Segments : {stats['segments']}, envoyés : {stats['segments'] - stats['skipped']}, "
+          f"redemandés : {stats['retried']}, sans styles locaux : {stats['fallback']}, "
+          f"textes protégés par des formules : {len(protected) + len(protected_sst)}")
     return {
-        "status": "success", "output_path": output_path, "time_seconds": round(execution_time, 2),
-        "input_tokens": total_input_tokens, "output_tokens": total_output_tokens, "total_cost_usd": total_cost
+        "status": "success", "output_path": output_path,
+        "time_seconds": round(time.time() - start_time, 2),
+        "input_tokens": stats["input_tokens"], "output_tokens": stats["output_tokens"],
+        "total_cost_usd": stats["input_tokens"] / 1e6 * PRICE_IN + stats["output_tokens"] / 1e6 * PRICE_OUT,
     }

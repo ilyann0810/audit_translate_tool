@@ -3,10 +3,13 @@ pandas
 openpyxl
 python-docx
 python-pptx
+lxml
 vertexai
 google-cloud-aiplatform
+google-genai
 numpy==1.26.4
 pydantic
-PyMuPDF>=1.23.0
-google-generativeai
+PyMuPDF>=1.24.0
+pyphen
 databricks-sdk
+fonttools

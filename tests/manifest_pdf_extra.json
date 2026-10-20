@@ -1,0 +1,8 @@
+{
+  "input_dir": "../../samples",
+  "documents": [
+    {"file": "pdf_hard/de_6pages.pdf", "direction": "Allemand ➔ Français"},
+    {"file": "pdf_hard/fr_6pages.pdf", "direction": "Français ➔ Allemand"},
+    {"file": "real/open_access.pdf", "direction": "Allemand ➔ Français"}
+  ]
+}

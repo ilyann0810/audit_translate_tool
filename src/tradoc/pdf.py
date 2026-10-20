@@ -77,6 +77,7 @@ SYSTEM_FONTS = {
     "serif": ("georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf"),
     "times": ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"),
     "sans": ("segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"),
+    "mono": ("cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"),
 }
 
 # Demi-gras disponibles. Ailleurs, un demi-gras devient une graisse normale,
@@ -97,10 +98,12 @@ ANY_TAG_RE = re.compile(r"</?s\d+>")
 
 class Style:
     __slots__ = ("font", "size", "color", "bold", "italic", "script",
-                 "semibold")
+                 "semibold", "deco")
 
     def __init__(self, span, script=None):
         self.script = script    # "sub", "sup" ou None
+        # Souligne / barre / surligne dessines a part : (("u", couleur), ...)
+        self.deco = span.get("_deco", ())
         self.font = span["font"]
         self.size = round(span["size"], 1)
         self.color = span["color"]
@@ -118,7 +121,10 @@ class Style:
 
     def key(self):
         return (self.font, self.size, self.color, self.bold, self.italic,
-                self.script, self.semibold)
+                self.script, self.semibold, self.deco)
+
+    def has(self, kind):
+        return next((c for k, c in self.deco if k == kind), None)
 
 
 class Block:
@@ -126,13 +132,18 @@ class Block:
 
     __slots__ = ("uid", "page", "rect", "line_rects", "styles", "base",
                  "text", "align", "rotate", "line_height", "ocr", "room",
-                 "angle", "tilt_lines",
-                 "category", "style", "box", "runs", "uniform_style")
+                 "angle", "tilt_lines", "origin", "hard_lines", "room_bottom",
+                 "decos", "hang", "category", "style", "box", "runs", "uniform_style")
 
     def __init__(self, uid, page, rect, line_rects, styles, base, text,
                  align, rotate, line_height, ocr=False):
         self.ocr = ocr              # texte a lire sur l'image
-        self.room = rect            # cadre d'ecriture, eventuellement elargi
+        self.origin = None          # point de base du premier caractere
+        self.hard_lines = False     # chaque ligne finit par un retour voulu
+        self.room_bottom = None     # bas de l'espace libre sous le bloc
+        self.decos = []             # traits / aplats de decoration a effacer
+        self.hang = None            # retrait suspendu d'une liste a puces (pt)
+        self.room = rect           # cadre d'ecriture, eventuellement elargi
         self.angle = 0.0            # texte en biais : angle en degres
         self.tilt_lines = []        # en biais : [(centre, texte, taille)]
         self.uid = uid
@@ -260,6 +271,7 @@ def _split_line(line):
                     "bbox": list(ch["bbox"])})
             span = cur["spans"][-1]
             span["text"] += c
+            span.setdefault("chars", []).append(ch)
             bb = span["bbox"]
             span["bbox"] = [min(bb[0], ch["bbox"][0]), min(bb[1], ch["bbox"][1]),
                             max(bb[2], ch["bbox"][2]), max(bb[3], ch["bbox"][3])]
@@ -307,22 +319,38 @@ def _hidden_spans(page):
     masked = {tuple(round(v) for v in im["bbox"]) for im in page.get_image_info()
               if im.get("has-mask")}
 
+    def alpha(d, key):
+        # Une opacite de 0.0 est une vraie valeur (aplat invisible pose par
+        # PowerPoint derriere chaque zone de texte) : « or 1 » la prenait
+        # pour une absence de valeur, donc pour un aplat opaque, et le
+        # texte pose dessus passait pour cache.
+        v = d.get(key)
+        return 1.0 if v is None else v
+
     def colour(j):
         kind, d = log[j][0], draw.get(j)
         if kind == "fill-image" or d is None:
             return None                     # image : couleur inconnue
-        if kind == "fill-path" and (d.get("fill_opacity") or 1) > 0.99:
+        if kind == "fill-path" and alpha(d, "fill_opacity") > 0.99:
             return d.get("fill")
-        if kind == "stroke-path" and (d.get("stroke_opacity") or 1) > 0.99:
+        if kind == "stroke-path" and alpha(d, "stroke_opacity") > 0.99:
             return d.get("color")
         return None
+
+    def visible(j):
+        kind, d = log[j][0], draw.get(j)
+        if kind == "fill-image" or d is None:
+            return True
+        if kind == "fill-path":
+            return alpha(d, "fill_opacity") > 0.05
+        return alpha(d, "stroke_opacity") > 0.05
 
     def opaque(j):
         kind, d = log[j][0], draw.get(j)
         if kind == "fill-image":
             return tuple(round(v) for v in log[j][1]) not in masked
         return (kind == "fill-path" and d is not None and d.get("fill")
-                and (d.get("fill_opacity") or 1) > 0.99)
+                and alpha(d, "fill_opacity") > 0.99)
 
     out = []
     for sp in page.get_texttrace():
@@ -331,6 +359,11 @@ def _hidden_spans(page):
             continue
         text = "".join(chr(c[0]) for c in sp["chars"])
         hidden = sp.get("type") == 3 or log[i][0] == "ignore-text"
+        # Hors de la page (reperes de mise en page de PowerPoint poses
+        # au-dessus du bord) : jamais affiche.
+        if not hidden:
+            inside = (r & page.rect).get_area()
+            hidden = inside < 0.5 * r.get_area()
         if not hidden:
             covered = sum((fitz.Rect(log[j][1]) & r).get_area()
                           for j in range(i + 1, len(log))
@@ -340,7 +373,7 @@ def _hidden_spans(page):
             mid = (r.tl + r.br) / 2
             under = [j for j in range(i)
                      if log[j][0] in ("fill-path", "stroke-path", "fill-image")
-                     and fitz.Rect(log[j][1]).contains(mid)]
+                     and fitz.Rect(log[j][1]).contains(mid) and visible(j)]
             if under:
                 bg = colour(under[-1])
             else:
@@ -391,6 +424,428 @@ def _split_columns(lines):
     return out
 
 
+def _line_text(ln):
+    return "".join(sp["text"] for sp in ln["spans"])
+
+
+def _line_size(ln):
+    return max((sp["size"] for sp in ln["spans"] if sp["text"].strip()), default=0.0)
+
+
+def _is_bullet(t):
+    t = t.strip()
+    return len(t) == 1 and (t in BULLETS or t == "-" or unicodedata.category(t) == "So")
+
+
+def _span_style(sp):
+    return (sp["font"], round(sp["size"], 1), sp["color"], sp.get("_deco", ()))
+
+
+def _parallel_lines(cur, nxt):
+    """Deux libelles empiles, pas un paragraphe qui continue : les deux
+    lignes commencent au meme endroit par le meme style (« Taux de
+    conversion | Payant : » en gras), et le style change exactement au
+    passage a la ligne (fin en normal, debut en gras). Un paragraphe qui
+    revient a la ligne continue dans le style de la fin de ligne."""
+    a = [s for s in cur["spans"] if s["text"].strip()]
+    b = [s for s in nxt["spans"] if s["text"].strip()]
+    if len(a) < 2 or not b:
+        return False
+    first_a, last_a, first_b = _span_style(a[0]), _span_style(a[-1]), _span_style(b[0])
+    return (first_a == first_b and last_a != first_b
+            and abs(cur["bbox"][0] - nxt["bbox"][0]) < 2)
+
+
+def _hanging_indent(lines):
+    """Retrait suspendu d'une liste dont la puce est dans la ligne
+    (« ● Texte… » puis lignes suivantes alignees sur « Texte ») : distance
+    entre la puce et le debut du texte, ou None. Les lignes sans puce
+    doivent toutes tomber sur ce retrait, sinon ce n'est pas une liste."""
+    marks, cont = [], []
+    for ln in lines:
+        spans = [s for s in ln["spans"] if s["text"].strip()]
+        if not spans:
+            continue
+        t0 = spans[0]["text"].lstrip()
+        if _is_bullet(t0[0]):
+            text_x = None
+            chars = [c for c in spans[0].get("chars", ()) if not c["c"].isspace()]
+            if len(chars) > 1:
+                text_x = chars[1]["bbox"][0]
+            elif len(spans) > 1:
+                text_x = spans[1]["bbox"][0]
+            if text_x is None:
+                return None
+            marks.append((ln["bbox"][0], text_x))
+        else:
+            cont.append(ln["bbox"][0])
+    if not marks:
+        return None
+    bx = min(m[0] for m in marks)
+    hangs = sorted(tx - b for b, tx in marks)
+    h = hangs[len(hangs) // 2]
+    size = max((_line_size(ln) for ln in lines), default=10)
+    if h <= 0.2 * size or h > 6 * size:
+        return None
+    if any(abs(c - (bx + h)) > 2.5 for c in cont):
+        return None
+    return h
+
+
+SIZE_JUMP = 1.35    # ecart de taille entre deux lignes qui separe deux blocs
+INLINE_JUMP = 3.0   # ecart de taille qui separe deux passages d'une meme ligne
+
+
+def _split_line_sizes(ln):
+    """Coupe une ligne entre deux passages de tailles sans commune mesure :
+    « Septembre 2026 | Nom » (24 pt) suivi du chiffre decoratif « 02 »
+    (300 pt) sur la meme ligne de base. Une fin de titre plus petite
+    (« (seulement Magasin) ») reste dans la ligne."""
+    spans = ln["spans"]
+    parts, cur, last = [], [], None
+    for sp in spans:
+        if sp["text"].strip():
+            if last and max(sp["size"], last) / max(1e-3, min(sp["size"], last)) > INLINE_JUMP:
+                parts.append(cur)
+                cur = []
+            last = sp["size"]
+        cur.append(sp)
+    parts.append(cur)
+    if len(parts) == 1:
+        return [ln]
+    out = []
+    for p in parts:
+        boxes = [fitz.Rect(sp["bbox"]) for sp in p if sp["text"].strip()]
+        if not boxes:
+            continue
+        r = boxes[0]
+        for bx in boxes[1:]:
+            r |= bx
+        out.append(dict(ln, spans=p, bbox=tuple(r)))
+    return out
+
+
+def _merge_continuations(cands, shapes):
+    """Recolle une phrase que MuPDF a coupee en plusieurs blocs, une ligne
+    par bloc (texte centre sous une image : « Preisfindung in Abhaengigkeit
+    von » / « Marktbegebenheiten und » / « Mitbewerbern »). Traduits
+    separement, ces morceaux donnent des fragments sans syntaxe.
+
+    Deux blocs se suivent si : meme police, taille et couleur ; le second
+    commence a un interligne sous le premier ; ils sont alignes (meme
+    marge gauche ou meme centre) ; aucun trait ni bord de cadre ne passe
+    entre eux ; et la phrase continue (le premier finit sur un mot en
+    minuscule sans ponctuation finale, ou le second commence en minuscule).
+    """
+    def style(ln):
+        sp = next((s for s in ln["spans"] if s["text"].strip()), None)
+        return (sp["font"], round(sp["size"], 1), sp["color"]) if sp else None
+
+    def continues(a_txt, b_txt):
+        a, b = a_txt.rstrip(), b_txt.lstrip()
+        if not a or not b or a[-1] in ".:!?;":
+            return False
+        last = re.findall(r"[^\W\d_]+", a)
+        return b[0].islower() or bool(last and last[-1][0].islower())
+
+    order = sorted(range(len(cands)), key=lambda i: (fitz.Rect(cands[i]["bbox"]).y0,
+                                                     fitz.Rect(cands[i]["bbox"]).x0))
+    alive = set(range(len(cands)))
+    for i in order:
+        if i not in alive:
+            continue
+        while True:
+            a = cands[i]
+            if _rotation(a["lines"][0]) != 0 or a.get("_ocr"):
+                break
+            la = a["lines"][-1]
+            ra, sa = fitz.Rect(la["bbox"]), _line_size(la)
+            best = None
+            for j in alive:
+                if j == i:
+                    continue
+                b = cands[j]
+                lb = b["lines"][0]
+                rb = fitz.Rect(lb["bbox"])
+                if (_rotation(lb) != 0 or b.get("_ocr") or style(lb) != style(la)
+                        or not (0 <= rb.y0 - ra.y1 <= 0.6 * sa)):
+                    continue
+                same_left = abs(rb.x0 - ra.x0) < 2
+                same_mid = abs((rb.x0 + rb.x1) - (ra.x0 + ra.x1)) / 2 < 3
+                if not (same_left or same_mid):
+                    continue
+                if not continues(_line_text(la), _line_text(lb)):
+                    continue
+                gap = fitz.Rect(min(ra.x0, rb.x0), ra.y1, max(ra.x1, rb.x1), rb.y0)
+                if any(s.x1 > gap.x0 and s.x0 < gap.x1 and
+                       (gap.y0 - 0.5 <= s.y0 <= gap.y1 + 0.5 or gap.y0 - 0.5 <= s.y1 <= gap.y1 + 0.5)
+                       for s in shapes):
+                    continue
+                best = j
+                break
+            if best is None:
+                break
+            b = cands[best]
+            r = fitz.Rect(a["bbox"]) | fitz.Rect(b["bbox"])
+            cands[i] = dict(a, lines=a["lines"] + b["lines"], bbox=tuple(r))
+            alive.discard(best)
+    return [cands[i] for i in sorted(alive)]
+
+
+def _rgb_int(c):
+    if isinstance(c, int):
+        return c
+    c = list(c)[:3] + [0] * (3 - len(c)) if c else [0, 0, 0]
+    if len(c) == 1:
+        c = c * 3
+    return (int(round(c[0] * 255)) << 16) | (int(round(c[1] * 255)) << 8) | int(round(c[2] * 255))
+
+
+def _near_white(c):
+    return all(((c >> s) & 255) > 240 for s in (16, 8, 0))
+
+
+def _page_decorations(page):
+    """Traits fins et aplats qui pourraient souligner, barrer ou surligner
+    un passage. PowerPoint et Word les exportent comme des dessins a part,
+    poses sous ou sur le texte : ils ne suivent pas une traduction."""
+    out = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.width < 2:
+            continue
+        # Aplat invisible (opacite nulle) : PowerPoint en pose derriere
+        # chaque zone de texte.
+        fill = d.get("fill") if (d.get("fill_opacity") is None
+                                 or d.get("fill_opacity") > 0.05) else None
+        stroke = d.get("color") if (d.get("stroke_opacity") is None
+                                    or d.get("stroke_opacity") > 0.05) else None
+        if "f" not in (d.get("type") or ""):
+            fill = None
+        if "s" not in (d.get("type") or ""):
+            stroke = None
+        col = fill if fill is not None else stroke
+        if col is None:
+            continue
+        d = dict(d, fill=fill)
+        thick = r.height
+        if fill is None:
+            thick = max(r.height, d.get("width") or 0)
+            r = fitz.Rect(r.x0, r.y0 - thick / 2, r.x1, r.y1 + thick / 2)
+        out.append({"rect": r, "thick": thick, "color": _rgb_int(col),
+                    "fill": d.get("fill") is not None})
+    return out
+
+
+def _tag_decorations(cands, decos):
+    """Attache a chaque passage les decorations qui le concernent.
+
+    Trait fin juste sous la ligne de base : souligne ; a mi-hauteur des
+    lettres : barre ; aplat ajuste a la hauteur du texte : surligne. Le
+    passage (ou les passages contigus) doit couvrir l'essentiel du trait :
+    une bordure de tableau, plus large que le texte de la case, n'est pas
+    un soulignement, et une case coloree n'est pas un surlignage.
+    """
+    # On travaille a la lettre : un souligne couvre souvent une partie
+    # seulement d'un passage de meme style (« Food Aktion » dans « Wegfall
+    # der Planung fuer Food Aktion! »).
+    lines = [ln for b in cands for ln in b["lines"]]
+    chars = [(ch, sp) for ln in lines for sp in ln["spans"] for ch in sp.get("chars", ())
+             if not ch["c"].isspace()]
+    if not chars or not decos:
+        return
+    for d in decos:
+        r = d["rect"]
+        thin = d["thick"] <= 3.0 and r.height <= 3.5
+        # Un trait, pas un point d'une trame de fond : long et allonge.
+        if thin and (r.width < 6 or r.width < 4 * max(r.height, d["thick"], 0.5)):
+            continue
+        if not thin and not (d["fill"] and not _near_white(d["color"])):
+            continue
+        cy = (r.y0 + r.y1) / 2
+        hits = {"u": [], "s": [], "h": []}
+        for ch, sp in chars:
+            cb = fitz.Rect(ch["bbox"])
+            size = sp["size"] or 10
+            cx = (cb.x0 + cb.x1) / 2
+            if not (r.x0 - 0.5 <= cx <= r.x1 + 0.5):
+                continue
+            if thin:
+                dy = cy - ch["origin"][1]
+                if -0.08 * size <= dy <= 0.35 * size:
+                    hits["u"].append(ch)
+                elif -0.6 * size <= dy <= -0.15 * size:
+                    hits["s"].append(ch)
+            else:
+                ov = min(cb.y1, r.y1) - max(cb.y0, r.y0)
+                if ov >= 0.8 * cb.height and r.height <= 1.6 * cb.height:
+                    hits["h"].append(ch)
+        for kind, lst in hits.items():
+            if not lst:
+                continue
+            x0 = min(ch["bbox"][0] for ch in lst)
+            x1 = max(ch["bbox"][2] for ch in lst)
+            need = 0.7 if kind in "us" else 0.85
+            if x1 - x0 < need * r.width:
+                continue
+            for ch in lst:
+                ch["_deco"] = tuple(sorted(set(ch.get("_deco", ())) | {(kind, d["color"])}))
+                ch["_deco_rect"] = fitz.Rect(r)
+            break
+    for ln in lines:
+        ln["spans"] = [part for sp in ln["spans"] for part in _split_span_deco(sp, ln)]
+
+
+def _split_span_deco(sp, ln):
+    """Coupe un passage la ou sa decoration change. Les espaces prennent la
+    decoration de la lettre qui les precede, sauf en fin de passage."""
+    chars = sp.get("chars")
+    if not chars or not any(ch.get("_deco") for ch in chars):
+        return [sp]
+    keys, last = [], ()
+    for i, ch in enumerate(chars):
+        if ch["c"].isspace():
+            nxt = next((c for c in chars[i + 1:] if not c["c"].isspace()), None)
+            k = last if nxt is not None and nxt.get("_deco", ()) == last else ()
+        else:
+            k = ch.get("_deco", ())
+            last = k
+        keys.append(k)
+    out, start = [], 0
+    for i in range(1, len(chars) + 1):
+        if i == len(chars) or keys[i] != keys[start]:
+            part = chars[start:i]
+            boxes = [fitz.Rect(c["bbox"]) for c in part]
+            bb = boxes[0]
+            for b in boxes[1:]:
+                bb |= b
+            new = dict(sp, text="".join(c["c"] for c in part), chars=part,
+                       origin=part[0]["origin"], bbox=list(bb))
+            new.pop("_deco", None)
+            new.pop("_deco_rects", None)
+            if keys[start]:
+                new["_deco"] = keys[start]
+                new["_deco_rects"] = list({tuple(c["_deco_rect"]) for c in part
+                                           if c.get("_deco_rect") is not None})
+                new["_deco_rects"] = [fitz.Rect(t) for t in new["_deco_rects"]]
+            out.append(new)
+            start = i
+    return out
+
+
+def _invisible_rects(page):
+    """Aplats sans encre : opacite nulle et pas de contour visible.
+    PowerPoint en pose un derriere chaque zone de texte, a la taille exacte
+    du texte ; le journal de peinture les liste comme des formes, et un
+    cadre d'ecriture « contenu » dans l'un d'eux ne pouvait plus s'elargir."""
+    out = []
+    for d in page.get_drawings():
+        fo = d.get("fill_opacity")
+        so = d.get("stroke_opacity")
+        typ = d.get("type") or ""
+        fill_seen = "f" in typ and (fo is None or fo > 0.05)
+        stroke_seen = "s" in typ and (so is None or so > 0.05)
+        if not fill_seen and not stroke_seen:
+            out.append(fitz.Rect(d["rect"]))
+    return out
+
+
+def _matches(r, rects, tol=1.0):
+    return any(abs(r.x0 - o.x0) < tol and abs(r.y0 - o.y0) < tol and
+               abs(r.x1 - o.x1) < tol and abs(r.y1 - o.y1) < tol for o in rects)
+
+
+def _page_shapes(page):
+    """Surfaces dessinees (aplats, traits, images), comme dans widen()."""
+    W = page.rect.width
+    ghost = _invisible_rects(page)
+    out = []
+    for kind, r in page.get_bboxlog():
+        r = fitz.Rect(r)
+        if (kind in ("fill-path", "stroke-path", "fill-image") and r.width < 0.95 * W
+                and not (kind == "fill-path" and _matches(r, ghost))):
+            out.append(r)
+    return out
+
+
+def _split_reading(block):
+    """Separe un bloc en morceaux qui se lisent chacun d'un seul tenant.
+
+    MuPDF regroupe parfois des textes sans rapport : sur une page de titre,
+    le grand chiffre « 02 », le titre et la ligne « Septembre 2026 | Nom »,
+    dans un ordre qui remonte la page. Recomposes en un paragraphe, ils
+    donnent « Septembre 2026 | Nom 02 Titre » sur une ligne. On coupe :
+    - avant une ligne placee plus haut que la precedente ;
+    - entre deux lignes de tailles tres differentes (titre / sous-titre) ;
+    - autour d'une ligne faite d'une seule puce. La puce n'appartient alors
+      a aucun bloc : elle reste dessinee a sa place, et le texte de l'element
+      commence a sa propre ligne au lieu de remonter a celle de la puce.
+    """
+    groups, cur, prev = [], [], None
+    lines = [part for ln in block["lines"] for part in _split_line_sizes(ln)]
+    for ln in lines:
+        t = _line_text(ln)
+        if not t.strip():
+            continue
+        if _is_bullet(t):
+            if cur:
+                groups.append(cur)
+            cur, prev = [], None
+            continue
+        # Debut d'une liste apres un texte sans puce (titre « Points a
+        # noter : » puis « • ... ») : la liste forme son propre bloc, avec
+        # son retrait suspendu.
+        if (cur and _is_bullet(t.lstrip()[:1] or "x")
+                and not any(_is_bullet(_line_text(c).lstrip()[:1] or "x") for c in cur)):
+            groups.append(cur)
+            cur, prev = [], None
+        if prev is not None:
+            pr, r = fitz.Rect(prev["bbox"]), fitz.Rect(ln["bbox"])
+            s0, s1 = _line_size(prev), _line_size(ln)
+            above = r.y1 < pr.y0 + 0.5 * pr.height
+            jump = s0 > 0 and s1 > 0 and max(s0, s1) / min(s0, s1) > SIZE_JUMP
+            if above or jump:
+                groups.append(cur)
+                cur = []
+        cur.append(ln)
+        prev = ln
+    if cur:
+        groups.append(cur)
+    if len(groups) == 1 and groups[0] == block["lines"]:
+        return [block]
+    out = []
+    for g in groups:
+        r = fitz.Rect(g[0]["bbox"])
+        for ln in g[1:]:
+            r |= fitz.Rect(ln["bbox"])
+        out.append(dict(block, bbox=tuple(r), lines=g))
+    return out
+
+
+def _split_bullets(block, bullets):
+    """Un element de liste par bloc quand les puces sont dessinees a part.
+
+    La puce reste a sa place d'origine. Si toute la liste formait un seul
+    bloc, un element traduit plus long qu'une ligne decalerait tous les
+    suivants, qui ne seraient plus en face de leur puce."""
+    lines = block["lines"]
+    if len(lines) < 2:
+        return [block]
+    cuts = [i for i in range(1, len(lines))
+            if _has_bullet(lines[i]["bbox"], bullets, _line_size(lines[i]) or 10)]
+    if not cuts:
+        return [block]
+    out, start = [], 0
+    for c in cuts + [len(lines)]:
+        part = lines[start:c]
+        r = fitz.Rect(part[0]["bbox"])
+        for ln in part[1:]:
+            r |= fitz.Rect(ln["bbox"])
+        out.append(dict(block, bbox=tuple(r), lines=part))
+        start = c
+    return out
+
+
 def _alignment(lines, rect):
     """Deduit l'alignement de la position des lignes dans le bloc."""
     if len(lines) < 2:
@@ -417,8 +872,14 @@ def _alignment(lines, rect):
     return "left"
 
 
-def _separator(cur, nxt, cur_w, block_w):
-    """Ce qui relie deux lignes : rien, une espace, ou un vrai retour."""
+def _separator(cur, nxt, cur_w, block_w, room=None, first_w=None, size=10.0):
+    """Ce qui relie deux lignes : rien, une espace, ou un vrai retour.
+
+    room : place restee libre a droite de la ligne courante ; first_w :
+    largeur du premier mot de la ligne suivante. Si ce mot tenait dans la
+    place libre, le retour n'etait pas automatique : il est voulu (element
+    de liste, libelle, ligne de tableau), meme sans ponctuation finale.
+    """
     a, b = cur.rstrip(), nxt.lstrip()
     if not a or not b:
         return " "
@@ -435,7 +896,33 @@ def _separator(cur, nxt, cur_w, block_w):
     # automatique.
     if cur_w < 0.6 * block_w and a[-1] in ".:!?;)":
         return "\n"
+    if room is not None and first_w is not None:
+        # Ligne courte : un retour automatique ne la laisse ainsi que devant
+        # un mot vraiment trop long. Ligne longue : marge plus prudente.
+        need = 1.1 * first_w if cur_w < 0.6 * block_w else 1.4 * first_w + 0.6 * size
+        if room > need:
+            return "\n"
     return " "
+
+
+def _bullet_boxes(page):
+    """Puces dessinees a part (un caractere seul : ●, ○, ■, -...) : une
+    ligne precedee d'une puce commence un nouvel element de liste."""
+    out = []
+    for b in page.get_text("dict")["blocks"]:
+        for ln in b.get("lines", []):
+            if _is_bullet(_line_text(ln)):
+                out.append(fitz.Rect(ln["bbox"]))
+    return out
+
+
+def _has_bullet(line_bbox, bullets, size):
+    r = fitz.Rect(line_bbox)
+    cy = (r.y0 + r.y1) / 2
+    for bb in bullets:
+        if bb.y0 - 1 <= cy <= bb.y1 + 1 and bb.x1 <= r.x0 + 1 and r.x0 - bb.x1 < 4 * size:
+            return True
+    return False
 
 
 def extract_blocks(doc):
@@ -450,6 +937,7 @@ def extract_blocks(doc):
         candidates = []
         tainted = set()     # polices qui ont produit du charabia sur la page
         hidden = _hidden_spans(page)
+        bullets = _bullet_boxes(page)
         for raw in page.get_text("rawdict", flags=FLAGS_RAW)["blocks"]:
             if raw.get("type") != 0 or not raw["lines"]:
                 continue
@@ -471,9 +959,17 @@ def extract_blocks(doc):
                                for sp in ln["spans"] if sp["text"].strip())
             pieces = (_split_columns(b["lines"])
                       if _rotation(b["lines"][0]) == 0 else [b])
+            pieces = [q for pc in pieces
+                      for q in (_split_reading(pc)
+                                if _rotation(pc["lines"][0]) == 0 else [pc])]
+            pieces = [q for pc in pieces
+                      for q in (_split_bullets(pc, bullets)
+                                if bullets and _rotation(pc["lines"][0]) == 0 else [pc])]
             for pc in pieces:
                 pc["_ocr"] = garbled
             candidates.extend(pieces)
+        candidates = _merge_continuations(candidates, _page_shapes(page))
+        _tag_decorations(candidates, _page_decorations(page))
 
         # Un bout de charabia trop court pour etre reconnu ("DT`") vient de
         # la meme police fautive : il passe aussi par la lecture visuelle.
@@ -524,6 +1020,7 @@ def extract_blocks(doc):
             ids = {base_key: 0}
             styles = {}
             parts = []          # (id de style, texte)
+            seps = []           # separateurs entre lignes
             block_w = rect.height if rot in (90, 270) else rect.width
 
             for i, ln in enumerate(lines):
@@ -541,8 +1038,21 @@ def extract_blocks(doc):
                     nxt = "".join(s["text"] for s in lines[i + 1]["spans"])
                     lb = ln["bbox"]
                     cur_w = (lb[3] - lb[1]) if rot in (90, 270) else (lb[2] - lb[0])
-                    sep = ("\n" if angle
-                           else _separator(cur, nxt, cur_w, block_w))
+                    room = first_w = None
+                    if rot == 0:
+                        nb = lines[i + 1]["bbox"]
+                        words = nxt.split()
+                        if words and nxt.strip():
+                            room = rect.x1 - lb[2]
+                            first_w = (nb[2] - nb[0]) * len(words[0]) / len(nxt.strip())
+                    size_here = max((sp["size"] for sp in ln["spans"]), default=10.0)
+                    if angle or (rot == 0 and (_has_bullet(lines[i + 1]["bbox"], bullets, size_here)
+                                               or _is_bullet(nxt.strip()[:1] or "x")
+                                               or _parallel_lines(ln, lines[i + 1]))):
+                        sep = "\n"
+                    else:
+                        sep = _separator(cur, nxt, cur_w, block_w, room, first_w, size_here)
+                    seps.append(sep)
                     if sep == "\x00":
                         # retire le tiret de cesure du dernier morceau
                         sid, txt = parts[-1]
@@ -611,6 +1121,24 @@ def extract_blocks(doc):
                 line_height=lh,
                 ocr=ocr,
             ))
+            first = next((sp for sp in lines[0]["spans"] if sp["text"].strip()), None)
+            if first is not None and not ocr:
+                blocks[-1].origin = (first["origin"][0], first["origin"][1])
+            blocks[-1].hard_lines = bool(seps) and all(x == "\n" for x in seps)
+            blocks[-1].decos = [r for ln in lines for sp in ln["spans"]
+                                for r in sp.get("_deco_rects", [])]
+            if rot == 0 and not angle:
+                blocks[-1].hang = _hanging_indent(lines)
+                if blocks[-1].hang:
+                    # Alignement du texte de la liste, puce mise a part :
+                    # les lignes a puce commencent plus a gauche que les
+                    # suivantes, ce qui faisait croire a un texte centre.
+                    h = blocks[-1].hang
+                    shifted = [dict(ln, bbox=(ln["bbox"][0] + h,) + tuple(ln["bbox"][1:]))
+                               if _is_bullet(_line_text(ln).lstrip()[:1] or "x") else ln
+                               for ln in lines]
+                    al = _alignment(shifted, fitz.Rect(rect.x0 + h, rect.y0, rect.x1, rect.y1))
+                    blocks[-1].align = al if al in ("left", "justify") else "left"
             if angle:
                 blk = blocks[-1]
                 blk.angle = angle
@@ -647,10 +1175,20 @@ def widen(doc, blocks):
         # une boite de hauteur nulle. Le journal donne la surface reelle,
         # epaisseur comprise, et inclut les images.
         shapes = []
+        # Les soulignes / barres / surlignes suivront le texte traduit : ce
+        # ne sont ni des cadres ni des obstacles.
+        deco_rects = [fitz.Rect(r) for b in items for r in b.decos]
+
+        def is_deco(r):
+            return any(abs(r.x0 - d.x0) < 1.5 and abs(r.x1 - d.x1) < 1.5
+                       and r.y0 >= d.y0 - 2 and r.y1 <= d.y1 + 2 for d in deco_rects)
+
+        ghost = _invisible_rects(page)
         for kind, r in page.get_bboxlog():
             r = fitz.Rect(r)
             if (kind not in ("fill-path", "stroke-path", "fill-image")
-                    or r.width >= 0.95 * W or r.height <= 0.5):
+                    or r.width >= 0.95 * W or r.height <= 0.5 or is_deco(r)
+                    or (kind == "fill-path" and _matches(r, ghost))):
                 continue
             if kind == "stroke-path":
                 # La boite d'un trait inclut une demi-epaisseur au-dela de
@@ -666,9 +1204,30 @@ def widen(doc, blocks):
                                   r.x1, r.y1 - r.width / 2)
             shapes.append(r)
         others = [fitz.Rect(b.rect) for b in items]
+        # Le texte laisse tel quel (horaires, nombres, sigles) n'a pas de
+        # bloc, mais reste un obstacle : « 15:10-15:25 » a droite d'un
+        # sous-titre de l'ordre du jour.
+        # Au niveau des passages, pas des lignes : MuPDF met parfois dans
+        # une meme ligne la date d'une page de titre et le chiffre geant
+        # « 04 » ; le cadre de la ligne commence alors en haut de la page
+        # et la date n'etait plus vue comme un obstacle sous le titre.
+        text_lines = []
+        for tb in page.get_text("dict")["blocks"]:
+            for ln in tb.get("lines", []):
+                for sp in ln["spans"]:
+                    if sp["text"].strip():
+                        text_lines.append(fitz.Rect(sp["bbox"]))
+        others.extend(text_lines)
+        H = page.rect.height
+        for b in items:
+            b.room_bottom = _free_below(b, text_lines, shapes, H)
 
         for b in items:
-            if b.rotate != 0 or b.angle or len(b.line_rects) != 1:
+            # Libelle d'une ligne, ou pile de lignes toutes terminees par un
+            # retour voulu (liste, libelles empiles) : chaque ligne peut
+            # s'allonger vers la droite. Un paragraphe qui revient a la
+            # ligne automatiquement garde sa largeur.
+            if b.rotate != 0 or b.angle or (len(b.line_rects) != 1 and not b.hard_lines):
                 continue
             r = fitz.Rect(b.rect)
             h = r.height
@@ -705,6 +1264,32 @@ def widen(doc, blocks):
             else:
                 room.x1 = max(r.x1, right)
             b.room = room
+
+
+def _free_below(b, text_lines, shapes, page_h):
+    """Bas de l'espace libre sous un bloc : jusqu'au prochain texte ou
+    dessin qui chevauche sa largeur, sans sortir de la forme qui le contient
+    (case de tableau, encadre) ni de la marge basse de la page. Un texte
+    traduit plus long peut y prendre une ligne de plus au lieu d'etre
+    reduit. Renvoie None pour un texte tourne ou en biais."""
+    if b.rotate != 0 or b.angle:
+        return None
+    r = fitz.Rect(b.rect)
+    size = b.base.size or 10
+    bottom = page_h - 18
+    inside = [o for o in shapes if o.x0 <= r.x0 + 1 and o.x1 >= r.x1 - 1
+              and o.y0 <= r.y0 + 1 and o.y1 >= r.y1 - 1]
+    for o in inside:
+        bottom = min(bottom, o.y1 - 0.3 * size)
+    for o in list(text_lines) + [s for s in shapes if s not in inside]:
+        if o.x1 <= r.x0 + 1 or o.x0 >= r.x1 - 1:
+            continue                    # a cote, pas en dessous
+        if o.y0 >= r.y1 - 1:
+            # On garde au moins un tiers de l'ecart d'origine avec ce qui
+            # suit : un titre qui descend ne doit pas coller a la date.
+            gap = o.y0 - r.y1
+            bottom = min(bottom, o.y0 - max(0.15 * size, gap / 3))
+    return max(r.y1, bottom)
 
 
 def _ink_columns(page, rect, zoom):
@@ -852,6 +1437,51 @@ def read_unreadable(doc, blocks, project, location, model, log=print):
 # Polices
 # --------------------------------------------------------------------------
 
+_PORTABLE = {
+    "calibri": ("carlito", "calibri"),
+    "arial": ("liberation sans", "arimo", "arial"),
+    "narrow": ("liberation sans narrow", "arial narrow"),
+    "serif": ("liberation serif", "tinos", "georgia", "dejavu serif"),
+    "times": ("liberation serif", "tinos", "times new roman"),
+    "sans": ("dejavu sans", "liberation sans", "noto sans", "segoe ui"),
+    "mono": ("liberation mono", "cousine", "dejavu sans mono", "courier new"),
+}
+_BASE14 = {"serif": "ti", "times": "ti", "mono": "co"}
+_portable_cache = {}
+
+
+def _portable_font(family, bold, italic):
+    """Octets d'une police de remplacement disponible partout."""
+    key = (family, bool(bold), bool(italic))
+    if key in _portable_cache:
+        return _portable_cache[key]
+    buf = None
+    try:
+        from core.text_fit import _get_index
+        idx = _get_index()
+        for fam in _PORTABLE.get(family, ()):
+            st = idx.get(fam)
+            if st:
+                path = (st.get((bool(bold), bool(italic))) or st.get((bool(bold), False))
+                        or st.get((False, False)))[0]
+                with open(path, "rb") as fh:
+                    buf = fh.read()
+                break
+    except Exception:
+        buf = None
+    if buf is None:
+        pre = _BASE14.get(family, "he")
+        suffix = {(False, False): "ro" if pre == "ti" else ("ur" if pre == "co" else "lv"),
+                  (True, False): "bo", (False, True): "it", (True, True): "bi"}[(bool(bold), bool(italic))]
+        name = pre + suffix if not (pre == "he" and suffix == "lv") else "helv"
+        try:
+            buf = fitz.Font(name).buffer
+        except Exception:
+            buf = None
+    _portable_cache[key] = buf
+    return buf
+
+
 class FontBook:
     """Trouve, pour chaque style, une police qui contient tous les caracteres
     du texte a ecrire, en preferant la police d'origine."""
@@ -878,6 +1508,59 @@ class FontBook:
                     continue
                 self.embedded.setdefault(name, []).append((buf, font))
         self.used = {"embarquee": 0, "systeme": 0, "base": 0}
+        self._repair(doc)
+
+    def _repair(self, doc):
+        """Polices embarquees sans table de caracteres (export PowerPoint /
+        Word) : on les reconstruit, accents compris (voir fontfix). Calcule
+        une fois par document, avant que le texte d'origine soit efface."""
+        fixed = getattr(doc, "_tradoc_repaired", None)
+        if fixed is None:
+            fixed = {}
+            try:
+                from .fontfix import repair_fonts
+                fixed = repair_fonts(self.embedded, doc, self._donor_buf, log=print)
+            except Exception as exc:
+                print("  reparation des polices impossible : %s" % exc)
+            try:
+                doc._tradoc_repaired = fixed
+            except Exception:
+                pass
+        for name, buf in fixed.items():
+            try:
+                self.embedded[name] = [(buf, fitz.Font(fontbuffer=buf))] + self.embedded[name]
+            except Exception:
+                continue
+
+    def _neighbours(self, name):
+        """Polices embarquees de la meme famille et de la meme pente, a une
+        graisse d'ecart au plus ; a egalite, la plus grasse."""
+        from .fontfix import style_of
+        fam, weight, italic = style_of(name)
+        out = []
+        for other in self.embedded:
+            f, w, it = style_of(other)
+            if other != name and f == fam and it == italic and abs(w - weight) <= 1:
+                out.append((abs(w - weight), -w, other))
+        return [n for _, _, n in sorted(out)]
+
+    def _donor_buf(self, name):
+        """Police systeme de meme graisse et de meme pente, qui fournit les
+        accents et signes absents d'une police embarquee."""
+        from .fontfix import style_of
+        _, weight, italic = style_of(name)
+        family = self._family(name)
+        bold, semibold = weight >= 7, weight in (5, 6)
+        if semibold and family in SEMIBOLD_FONTS and family != "mono":
+            fname = SEMIBOLD_FONTS[family][int(italic)]
+        else:
+            fname = SYSTEM_FONTS[family][int(bold) + 2 * int(italic)]
+        path = os.path.join(FONT_DIR, fname)
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return _portable_font(family, bold or semibold, italic)
 
     @staticmethod
     def _family(name):
@@ -935,6 +1618,14 @@ class FontBook:
             probe = next((c for c in "aeinorstAEINORST"
                           if font.has_glyph(ord(c)) and self._draws(buf, c)),
                          None)
+            if probe is None:
+                # Police de signes (icones) : un de ses propres caracteres.
+                try:
+                    cps = font.valid_codepoints()
+                except Exception:
+                    cps = []
+                probe = next((chr(cp) for cp in cps[:50]
+                              if cp > 32 and self._draws(buf, chr(cp))), None)
             ok = False
             if probe:
                 tmp = fitz.open()
@@ -971,6 +1662,13 @@ class FontBook:
             if self._covers(buf, font, text):
                 self.used["embarquee"] += 1
                 return buf, "embarquee"
+        # Police d'origine inutilisable : graisse voisine de la meme famille
+        # (LidlFontPro-SemiBold -> LidlFontPro-Bold / -Medium).
+        for name in self._neighbours(style.font):
+            for buf, font in self.embedded[name]:
+                if self._covers(buf, font, text):
+                    self.used["embarquee"] += 1
+                    return buf, "embarquee"
 
         family = self._family(style.font)
         if style.semibold and family in SEMIBOLD_FONTS:
@@ -989,6 +1687,13 @@ class FontBook:
             self.used["systeme"] += 1
             return self.cache[path], "systeme"
 
+        # Hors Windows (serveur Linux) : police equivalente installee
+        # (Liberation, Carlito, DejaVu...), sinon police incluse dans
+        # PyMuPDF, dans la bonne graisse : le gras ne doit pas se perdre.
+        buf = _portable_font(family, style.bold or style.semibold, style.italic)
+        if buf:
+            self.used["systeme"] += 1
+            return buf, "systeme"
         self.used["base"] += 1
         return None, "base"
 
@@ -1080,26 +1785,109 @@ def _render(page, block, pieces, fonts, hyph=None):
         by_style[sid] = by_style.get(sid, "") + txt
 
     base_fam, base_st = family_for(0, by_style.get(0, "") or "a")
-    body = []
-    for sid, txt in pieces:
+    fams = {0: (base_fam, base_st)}
+    for sid in by_style:
+        if sid != 0:
+            fams[sid] = family_for(sid, by_style[sid])
+
+    def deco_css(st):
+        lines = [w for k_, w in (("u", "underline"), ("s", "line-through")) if st.has(k_) is not None]
+        return "text-decoration:%s;" % " ".join(lines) if lines else ""
+
+    def span_html(sid, txt, k, marks, extra=""):
         esc = html.escape(txt).replace("\n", "<br>")
-        if sid == 0:
-            body.append(esc)
-            continue
-        fam, st = family_for(sid, by_style[sid])
+        if sid == 0 and not extra:
+            return esc
+        fam, st = fams[sid]
         shift = {"sub": "vertical-align:sub;",
                  "sup": "vertical-align:super;"}.get(st.script, "")
-        body.append(
-            '<span style="font-family:%s;font-size:%.1fpx;color:%s;%s'
-            'font-weight:normal;font-style:normal">%s</span>'
-            % (fam, st.size, _hex(st.color), shift, esc))
+        return ('<span style="font-family:%s;font-size:%.2fpx;color:%s;%s%s%s'
+                'font-weight:normal;font-style:normal">%s</span>'
+                % (fam, st.size * k, _hex(marks.get(sid, st.color)), shift,
+                   deco_css(st), extra, esc))
 
-    doc_html = (
-        '<p style="font-family:%s;font-size:%.1fpx;color:%s;'
-        'line-height:%.2f;text-align:%s;font-weight:normal;'
-        'font-style:normal">%s</p>'
-        % (base_fam, base_st.size, _hex(base_st.color), block.line_height,
-           block.align, "".join(body)))
+    # Liste a puces avec retrait suspendu : un paragraphe par element, la
+    # puce dans la marge, le texte qui commence au retrait d'origine.
+    paragraphs = None
+    if getattr(block, "hang", None):
+        paragraphs, cur = [], []
+        for sid, txt in pieces:
+            parts = txt.split("\n")
+            for i, part in enumerate(parts):
+                if i:
+                    paragraphs.append(cur)
+                    cur = []
+                if part:
+                    cur.append((sid, part))
+        paragraphs.append(cur)
+        paragraphs = [p for p in paragraphs if "".join(t for _, t in p).strip()]
+
+    bullet_w = {}
+
+    def _advance(st, text, size):
+        buf, _ = fonts.pick(st, text)
+        try:
+            f = fitz.Font(fontbuffer=buf) if buf else fitz.Font("helv")
+            return f.text_length(text, fontsize=size)
+        except Exception:
+            return 0.5 * size * len(text)
+
+    def bullet_gap(sid, ch, k, marks):
+        """Espaces insecables apres la puce pour que le texte tombe au
+        retrait d'origine. Le moteur HTML ignore letter-spacing et les
+        marges en ligne : on met n espaces a la taille du texte, puis un
+        dernier plus petit pour l'appoint (il n'agrandit pas la ligne)."""
+        key = (sid, ch, round(k, 3))
+        if key not in bullet_w:
+            st = fams[sid][1]
+            gap = max(0.0, block.hang * k - _advance(st, ch, st.size * k))
+            size = base_st.size * k
+            sp_w = _advance(base_st, " ", size) or 0.25 * size
+            n = int(gap // sp_w)
+            rest = gap - n * sp_w
+            bullet_w[key] = (n, size * rest / sp_w if rest > 0.3 else 0.0)
+        n, small = bullet_w[key]
+        out = span_html(0, " " * n, k, marks, " ") if n else ""
+        if small:
+            fam = fams[0][0]
+            out += ('<span style="font-family:%s;font-size:%.2fpx"> </span>'
+                    % (fam, small))
+        return out
+
+    def p_open(k, marks, extra=""):
+        return ('<p style="font-family:%s;font-size:%.2fpx;color:%s;%s'
+                'line-height:%.2f;text-align:%s;font-weight:normal;'
+                'font-style:normal;%s">'
+                % (base_fam, base_st.size * k, _hex(marks.get(0, base_st.color)),
+                   deco_css(base_st), block.line_height, block.align, extra))
+
+    def make_html(k, marks=None):
+        """HTML du bloc, tailles multipliees par k. marks : {id de style:
+        couleur} pour reperer ou tombent les passages surlignes."""
+        marks = marks or {}
+        if paragraphs is None:
+            body = "".join(span_html(sid, txt, k, marks) for sid, txt in pieces)
+            return p_open(k, marks) + body + "</p>"
+        out = []
+        hang = block.hang * k
+        for para in paragraphs:
+            items = list(para)
+            # premier caractere visible : une puce ?
+            j = next((i for i, (_, t) in enumerate(items) if t.strip()), None)
+            first = items[j][1].lstrip() if j is not None else ""
+            if first and _is_bullet(first[0]):
+                sid = items[j][0]
+                rest = first[1:].lstrip()
+                head = span_html(sid, first[0], k, marks) + bullet_gap(sid, first[0], k, marks)
+                items = items[:j] + ([(sid, rest)] if rest else []) + items[j + 1:]
+                body = head + "".join(span_html(s, t, k, marks) for s, t in items[j:])
+                style = "padding-left:%.2fpx;text-indent:-%.2fpx" % (hang, hang)
+            else:
+                body = "".join(span_html(s, t, k, marks) for s, t in items)
+                style = "padding-left:%.2fpx" % hang
+            out.append(p_open(k, marks, style) + body + "</p>")
+        return "".join(out)
+
     css_text = "\n".join(css)
 
     # Un peu d'air : le cadre d'origine colle aux glyphes allemands.
@@ -1113,19 +1901,155 @@ def _render(page, block, pieces, fonts, hyph=None):
                             # deja ajuste a un contenant par widen()
         r.y1 += 0.25 * base_st.size
 
-    spare, scale = page.insert_htmlbox(
-        r, doc_html, css=css_text, archive=arch,
-        scale_low=MIN_SCALE, rotate=block.rotate)
-    if spare >= 0:
-        return scale, True
+    # Echelle : on ne se fie pas a la reponse d'insert_htmlbox, qui annonce
+    # parfois que tout tient (marge 0, echelle 1) alors qu'il a laisse
+    # tomber la derniere ligne : « ... vers « » sans la suite. On mesure
+    # la hauteur reelle du texte dans un cadre tres haut, a la largeur du
+    # cadre, et on cherche la plus grande taille qui tient.
+    rot = block.rotate in (90, 270)
+    box_w, box_h = (r.height, r.width) if rot else (r.width, r.height)
+    # Le cadre d'origine colle aux lettres ; une ligne composee est un peu
+    # plus haute (interligne). Sans cette tolerance, un libelle d'une
+    # ligne qui tient etait reduit de quelques pour cent. Elle reste bien
+    # en dessous d'une ligne : une ligne en trop est toujours detectee.
+    tol = (max(block.line_height, 1.0) - 1.0 + 0.45) * base_st.size
+    box_h += tol
+    k, fits = _fit_scale(make_html, css_text, arch, box_w, box_h)
+    multi = len(block.line_rects) > 1
+    if (k < 0.99 and (multi or k < 0.8) and not rot and block.room_bottom
+            and block.room_bottom > r.y1 + 1):
+        # Espace libre sous le bloc : une ligne de plus plutot qu'un texte
+        # plus petit que l'original. Un titre d'une ligne reste sur une
+        # ligne tant que la reduction est legere.
+        k2, fits2 = _fit_scale(make_html, css_text, arch, box_w,
+                               block.room_bottom - r.y0)
+        if k2 > k + 0.02:
+            k, fits = k2, fits2
+            r = fitz.Rect(r.x0, r.y0, r.x1, block.room_bottom)
+    doc_html = make_html(k)
 
-    # insert_htmlbox n'ecrit RIEN quand le texte ne tient pas a l'echelle
-    # minimale. On force l'ecriture sans limite plutot que de perdre le
-    # texte, et on signale le debordement.
-    spare, scale = page.insert_htmlbox(
-        r, doc_html, css=css_text, archive=arch,
-        scale_low=0, rotate=block.rotate)
-    return scale, False
+    r = _align_first_line(page, block, r, doc_html, css_text, arch)
+    # Un peu de marge en bas : la mesure garantit deja que le texte tient,
+    # cette marge evite seulement qu'un arrondi fasse tomber une ligne.
+    slack = 0.6 * base_st.size * k
+    if block.rotate == 0:
+        r = fitz.Rect(r.x0, r.y0, r.x1, r.y1 + slack)
+    elif block.rotate == 90:
+        r = fitz.Rect(r.x0, r.y0, r.x1 + slack, r.y1)
+    elif block.rotate == 270:
+        r = fitz.Rect(r.x0 - slack, r.y0, r.x1, r.y1)
+    else:
+        r = fitz.Rect(r.x0, r.y0 - slack, r.x1, r.y1)
+    _draw_highlights(page, block, r, make_html, k, css_text, arch)
+    page.insert_htmlbox(r, doc_html, css=css_text, archive=arch,
+                        scale_low=0, rotate=block.rotate)
+    return k, fits
+
+
+def _draw_highlights(page, block, r, make_html, k, css_text, arch):
+    """Surlignage : le moteur HTML ne sait pas peindre un fond derriere un
+    passage. On compose le bloc sur une page brouillon en donnant a chaque
+    passage surligne une couleur temoin, on releve ou tombent ces passages,
+    et on peint les aplats sur la vraie page avant d'y ecrire le texte."""
+    hl = {sid: st.has("h") for sid, st in block.styles.items() if st.has("h") is not None}
+    if not hl or block.rotate != 0:
+        return
+    marks = {sid: 0x010203 + 7 * i for i, sid in enumerate(hl)}
+    tmp = fitz.open()
+    try:
+        pg = tmp.new_page(width=page.rect.width, height=page.rect.height)
+        pg.insert_htmlbox(r, make_html(k, marks), css=css_text, archive=arch, scale_low=0)
+        back = {v: hl[sid] for sid, v in marks.items()}
+        for b in pg.get_text("dict")["blocks"]:
+            for ln in b.get("lines", []):
+                for sp in ln["spans"]:
+                    if sp["color"] in back and sp["text"].strip():
+                        c = back[sp["color"]]
+                        rgb = (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255)
+                        page.draw_rect(fitz.Rect(sp["bbox"]), color=None, fill=rgb, width=0)
+    finally:
+        tmp.close()
+
+
+def _natural_height(html_text, css_text, arch, width):
+    """Hauteur occupee par le HTML compose a la largeur donnee."""
+    tall = 20000.0
+    tmp = fitz.open()
+    try:
+        pg = tmp.new_page(width=width + 10, height=tall + 10)
+        spare, _ = pg.insert_htmlbox(fitz.Rect(0, 0, width, tall), html_text,
+                                     css=css_text, archive=arch, scale_low=1)
+        return tall - spare if spare >= 0 else float("inf")
+    finally:
+        tmp.close()
+
+
+def _fit_scale(make_html, css_text, arch, width, height):
+    """(echelle, tient) : la plus grande echelle <= 1 a laquelle le texte
+    tient dans le cadre. Sous MIN_SCALE, on continue a reduire pour ne
+    rien perdre, mais le bloc est signale comme debordant."""
+    def ok(k):
+        return _natural_height(make_html(k), css_text, arch, width) <= height + 0.5
+    if ok(1.0):
+        return 1.0, True
+    lo, hi, fits = MIN_SCALE, 1.0, True
+    if not ok(MIN_SCALE):
+        lo, hi, fits = 0.25, MIN_SCALE, False
+        if not ok(lo):
+            return lo, False
+    for _ in range(7):
+        mid = (lo + hi) / 2
+        if ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo, fits
+
+
+def _align_first_line(page, block, r, doc_html, css_text, arch):
+    """Decale le cadre pour que la premiere ligne reecrite tombe sur la
+    ligne d'origine.
+
+    Le moteur HTML place la premiere ligne un peu plus bas (et un peu plus
+    a droite) que le texte d'origine : 2 points sur du 9 pt, 4 sur un titre
+    de 28 pt. Un soulignement ou un filet dessine sous le texte se retrouve
+    alors en travers des lettres. On rend le bloc sur une page brouillon,
+    on mesure ou tombe le premier caractere, et on corrige.
+    """
+    if block.origin is None or block.rotate != 0:
+        return r
+    try:
+        tmp = fitz.open()
+        scratch = tmp.new_page(width=page.rect.width, height=page.rect.height)
+        spare, _ = scratch.insert_htmlbox(r, doc_html, css=css_text, archive=arch,
+                                          scale_low=MIN_SCALE)
+        if spare < 0:
+            tmp.close()
+            return r
+        got = None
+        for b in scratch.get_text("dict")["blocks"]:
+            for ln in b.get("lines", []):
+                for sp in ln["spans"]:
+                    if sp["text"].strip():
+                        got = sp["origin"]
+                        break
+                if got:
+                    break
+            if got:
+                break
+        tmp.close()
+        if got is None:
+            return r
+        size = block.base.size or 10
+        dy = block.origin[1] - got[1]
+        dx = block.origin[0] - got[0] if block.align in ("left", "justify") else 0.0
+        if abs(dy) > 0.6 * size:
+            dy = 0.0        # le texte a change de ligne : pas de recalage
+        if abs(dx) > 0.6 * size:
+            dx = 0.0
+        return fitz.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy)
+    except Exception:
+        return r
 
 
 def _drawing_key(d):
@@ -1410,6 +2334,19 @@ def rewrite(doc, blocks, translations, log=print, hyph=None):
         stats["recoloured"] += fixed
         stats["recolour_skipped"] = stats.get("recolour_skipped", 0) + skipped
 
+        # Soulignes, barres et surlignes d'origine : ils sont redessines
+        # avec le texte traduit, sous les bons mots. On n'efface que le
+        # dessin entierement couvert par la zone de la decoration.
+        decos = [r for b in items if not b.angle for r in b.decos]
+        if decos:
+            for r in decos:
+                page.add_redact_annot(fitz.Rect(r) + (-0.6, -0.6, 0.6, 0.6), fill=False)
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                text=fitz.PDF_REDACT_TEXT_NONE)
+            stats["decorations"] = stats.get("decorations", 0) + len(decos)
+
         for b in items:
             if b.angle:
                 _render_tilted(page, b, translations[b.uid], fonts)
@@ -1438,6 +2375,46 @@ def rewrite(doc, blocks, translations, log=print, hyph=None):
 
     stats["fonts"] = fonts.used
     return stats
+
+
+_NUM_RE = re.compile(r"\d+(?:[.,:/]\d+)*")
+
+
+def keeps_information(full, short):
+    """Une version courte ne doit rien perdre : memes passages stylés
+    (un mot en rouge ou en gras porte souvent l'information), memes
+    nombres et dates, memes retours a la ligne, et presque tous les mots."""
+    tags = lambda t: sorted(re.findall(r"<s(\d+)>", t))  # noqa: E731
+    if tags(full) != tags(short):
+        return False
+    if sorted(_NUM_RE.findall(full)) != sorted(_NUM_RE.findall(short)):
+        return False
+    if not enough_words(full, short):
+        return False
+    if new_abbreviations(full, short):
+        return False
+    return full.count("\n") == short.count("\n")
+
+
+_ABBR_RE = re.compile(r"(?<![\w.])([^\W\d_]{1,7})\.(?=[\s/|,)]|$)")
+
+
+def new_abbreviations(full, short):
+    """Mots abreges par un point ("Com.", "Planif.") absents de la version
+    complete : la version courte a invente des abreviations."""
+    plain = lambda t: re.sub(r"<[^>]+>", " ", t)  # noqa: E731
+    have = set(_ABBR_RE.findall(plain(full)))
+    return [w for w in _ABBR_RE.findall(plain(short)) if w not in have]
+
+
+def enough_words(full, short):
+    """Un libelle court (6 mots ou moins) ne perd aucun mot ("Mer 18.11.26"
+    ne devient pas "18.11.26") ; un texte plus long en garde au moins 60 %."""
+    words = lambda t: re.findall(r"[^\W\d_]+", re.sub(r"<[^>]+>", " ", t))  # noqa: E731
+    n_full, n_short = len(words(full)), len(words(short))
+    if n_full <= 6:
+        return n_short >= n_full
+    return n_short >= 0.6 * n_full
 
 
 def tighten(doc, blocks, translations, target, project, location, model,
@@ -1486,6 +2463,8 @@ def tighten(doc, blocks, translations, target, project, location, model,
     by_uid = {b.uid: b for b in blocks}
     better = 0
     for uid, txt in short.items():
+        if not keeps_information(translations[uid], txt):
+            continue
         if measure(by_uid[uid], txt) > scales[uid] + 0.03:
             translations[uid] = txt
             better += 1
