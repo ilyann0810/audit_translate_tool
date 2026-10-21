@@ -1,22 +1,5 @@
 """
 Traduction PPTX en gardant la forme et le style.
-
-Principes :
-  - on ne touche qu'au texte : cadres, marges, ancrage, interligne, puces,
-    couleurs et polices restent ceux de l'original ;
-  - chaque paragraphe est envoye au modele sous forme balisee (voir
-    core/segments.py) et chaque morceau traduit recoit une COPIE INTEGRALE
-    du style du run d'origine (couleur de theme, surlignage, police...) ;
-  - les champs (numero de diapositive, date) et autres objets restent en
-    place ;
-  - avant d'ecrire, on mesure la place que prend la traduction dans son
-    cadre et on la compare a l'original mesure de la meme facon. Si elle
-    ne tient plus : la forme s'agrandit si elle est en ajustement auto et
-    qu'il y a de la place, sinon on demande au modele une version plus
-    courte, puis on reduit la taille du texte juste ce qu'il faut ;
-  - sont traduits : diapositives (formes, groupes, tableaux), notes,
-    masques et dispositions, graphiques (titres, series, categories) et
-    SmartArt.
 """
 import copy
 import math
@@ -45,19 +28,16 @@ EMU_PER_PT = 12700
 
 LOCALE = {"fr": "fr-FR", "de": "de-DE"}
 
-# Reduction de la taille du texte : en dessous de SHORTEN_BELOW on demande
-# d'abord une formulation plus courte ; MIN_SCALE est le plancher.
+# Réduction de la taille du texte
 SHORTEN_BELOW = 0.85
 MIN_SCALE = 0.6
 SCALE_STEP = 0.025
 
-# Attributs de run sans effet visuel : ignores pour regrouper les runs.
 _NEUTRAL_RPR_ATTRS = {"lang", "altLang", "dirty", "err", "noProof", "smtClean", "smtId", "bmk"}
 
 _TITLE_TYPES = {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.VERTICAL_TITLE}
 _OTHER_TYPES = {PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER,
                 PP_PLACEHOLDER.HEADER}
-
 
 # --------------------------------------------------------------------------
 # Segments : paragraphe DrawingML <-> texte balise
@@ -72,20 +52,16 @@ def _style_key(rpr):
             del el.attrib[a]
     return etree.tostring(el, encoding="unicode")
 
-
 _CONNECTORS = set("""
 et ou de des du la le les l en à au aux pour par sur avec sans dans d un une que qui
 und oder der die das den dem des im in mit für von zu zur zum bei auf an aus nach ein eine
 and or of the to for with
 """.split())
 
-
 def _para_text(p):
     return "".join(t.text or "" for t in p.iter(A + "t"))
 
-
 def _has_bullet(p, chain):
-    """Puce visible (y compris heritee du gabarit) ?"""
     ppr = p.find(A + "pPr")
     lvl = int(ppr.get("lvl", "0")) if ppr is not None else 0
     cands = [ppr] + [Chain._lvl(el, lvl) for el in chain.lst]
@@ -94,24 +70,21 @@ def _has_bullet(p, chain):
             continue
         if c.find(A + "buNone") is not None:
             return False
-        if c.find(A + "buChar") is not None or c.find(A + "buAutoNum") is not None                 or c.find(A + "buBlip") is not None:
+        if c.find(A + "buChar") is not None or c.find(A + "buAutoNum") is not None or c.find(A + "buBlip") is not None:
             return True
     return False
 
-
 def is_continuation(prev, nxt, body):
-    """Le paragraphe `nxt` continue-t-il la phrase de `prev` ?
-
-    Une phrase coupee par Entree (retour a la ligne fait a la main) donne
-    deux paragraphes ; traduits separement, la coupure tombe au milieu de
-    la phrase traduite. Il faut : meme niveau, pas de puce sur la suite,
-    une phrase qui ne se termine pas, une ligne coupee qui remplit au moins
-    la moitie du cadre, et une suite en minuscule ou apres un mot de
-    liaison ("et", "und"...) ou un trait d'union.
-    """
     a, b = _para_text(prev).rstrip(), _para_text(nxt).lstrip()
     if not a or not b:
         return False
+
+    # Protection des champs dynamiques (numéros de diapositive) sans erreur d'attribut
+    el_prev = getattr(prev, '_element', prev)
+    el_nxt = getattr(nxt, '_element', nxt)
+    if el_prev.find(A + "fld") is not None or el_nxt.find(A + "fld") is not None:
+        return False
+
     if a[-1] in ".:;!?),•" or b[0] in "-•–*·>" or re.match(r"^\d+[.)]", b):
         return False
     pp, pn = prev.find(A + "pPr"), nxt.find(A + "pPr")
@@ -133,31 +106,22 @@ def is_continuation(prev, nxt, body):
         except Exception:
             fill = None
     if fill is not None and fill < 0.5:
-        return False        # ligne courte : retour voulu
+        return False
     if b[0].islower() or linked:
         return True
-    # Ligne presque pleine, phrase non terminee : retour fait a la main
-    # meme si la suite commence par une majuscule ("rayon" + "DPH").
     return fill is not None and fill >= 0.85 and b[0].isalpha()
 
-
 def group_segment(paras):
-    """Segment pour plusieurs paragraphes formant une seule phrase. Le
-    texte traduit ira dans le premier, les suivants seront retires."""
     seg = paragraph_segment(paras[0], require_text=False)
     for nxt in paras[1:]:
         prev_text = "".join(it[2] for it in seg.items if it[0] == "t")
         nseg = paragraph_segment(nxt, require_text=False)
-        first = next((it for it in nseg.items if it[0] == "t"), None)
         if prev_text.endswith(("-", "/")) and not prev_text.endswith((" -", " /")):
-            # "stop-" + "produit", "terre/" + "oignons" : on recolle sans
-            # espace et on garde le signe (le modele traduit le mot entier).
             pass
         elif prev_text and not prev_text.endswith(" "):
             last_style = next((it for it in reversed(seg.items) if it[0] == "t"), None)
             sid = last_style[1] if last_style else 0
             seg.items.append(("t", sid, " "))
-        # Reprise des morceaux du paragraphe suivant avec leurs styles.
         for it in nseg.items:
             if it[0] == "t":
                 key = nseg.meta["keys"][it[1]]
@@ -171,9 +135,7 @@ def group_segment(paras):
     seg.meta["merged"] = list(paras[1:])
     return seg if seg.has_text() else None
 
-
 def paragraph_segment(p, require_text=True):
-    """Segment pour un <a:p> ; None s'il n'y a rien a traduire."""
     seg = Segment()
     seg.meta["p"] = p
     seg.meta["keys"] = {}
@@ -197,15 +159,12 @@ def paragraph_segment(p, require_text=True):
             seg.meta.setdefault("br", child)
             seg.add_break("br")
         else:
-            # Champ (a:fld), formule, extension... : objet conserve tel quel.
             seg.add_object(child)
     if not require_text:
         return seg
     return seg if seg.has_text() else None
 
-
 def rebuild_paragraph(seg, items, target_lang):
-    """Remplace le contenu de <a:p> par la traduction."""
     p = seg.meta["p"]
     end = p.find(A + "endParaRPr")
     for child in list(p):
@@ -253,7 +212,6 @@ def rebuild_paragraph(seg, items, target_lang):
                     new_run(piece, rpr)
             last_rpr = rpr
         elif kind == "tab":
-            # Tabulation : un run d'un seul caractere dans le style voisin.
             new_run("\t", last_rpr)
         elif kind == "br":
             new_br(last_rpr)
@@ -266,9 +224,8 @@ def rebuild_paragraph(seg, items, target_lang):
         if parent is not None:
             parent.remove(other)
 
-
 # --------------------------------------------------------------------------
-# Styles effectifs (heritage PowerPoint)
+# Styles effectifs (héritage PowerPoint)
 # --------------------------------------------------------------------------
 
 class Theme:
@@ -297,11 +254,7 @@ class Theme:
             return self.minor
         return face
 
-
 class Chain:
-    """Pile des styles de liste dont herite un corps de texte, du plus
-    specifique au plus general, et pile des bodyPr (forme puis gabarits)."""
-
     def __init__(self, lst_styles, body_prs, theme, title=False):
         self.lst = [x for x in lst_styles if x is not None]
         self.body = [x for x in body_prs if x is not None]
@@ -378,10 +331,8 @@ class Chain:
                     return tag, el
         return None, None
 
-
 def _bool(v):
     return v in ("1", "true", "on")
-
 
 def run_metrics(chain, rpr, lvl):
     size = chain.rpr_attr(rpr, lvl, "sz")
@@ -390,9 +341,7 @@ def run_metrics(chain, rpr, lvl):
     italic = _bool(chain.rpr_attr(rpr, lvl, "i"))
     return size, get_font(chain.latin(rpr, lvl), bold, italic)
 
-
 def measure_paragraph(chain, p, runs):
-    """runs : [(texte, rPr)] -> Para mesurable."""
     ppr = p.find(A + "pPr")
     lvl = int(ppr.get("lvl", "0")) if ppr is not None else 0
     out = []
@@ -417,7 +366,6 @@ def measure_paragraph(chain, p, runs):
                 indent=(int(mar) / EMU_PER_PT) if mar else 0.0,
                 first_indent=(int(ind) / EMU_PER_PT) if ind and int(ind) > 0 else 0.0)
 
-
 def original_runs(p):
     runs = []
     for child in p:
@@ -427,7 +375,6 @@ def original_runs(p):
         elif child.tag == A + "br":
             runs.append(("\n", child.find(A + "rPr")))
     return runs
-
 
 def translated_runs(seg, items):
     runs = []
@@ -447,38 +394,33 @@ def translated_runs(seg, items):
                 runs.append((t.text, el.find(A + "rPr")))
     return runs
 
-
 # --------------------------------------------------------------------------
 # Inventaire des corps de texte
 # --------------------------------------------------------------------------
 
 class Body:
-    """Un corps de texte (forme, cellule, note...) et sa geometrie."""
-
     def __init__(self, txBody, chain, width=None, height=None, kind="shape",
                  context="", shape=None, slide_h=None, rects=None, cell=None,
                  rect=None, framed=False):
         self.txBody = txBody
         self.chain = chain
-        self.width = width          # en points, None si inconnu
+        self.width = width
         self.height = height
-        self.kind = kind            # shape, cell, notes, chart, smartart
+        self.kind = kind
         self.context = context
         self.shape = shape
         self.slide_h = slide_h
-        self.rects = rects if rects is not None else []   # formes de la diapositive
-        self.rect = rect            # (x0, y0, x1, y1) absolu, en points
-        self.framed = framed        # fond ou bordure visible
-        self.cell = cell            # (ligne, colonne, nb lignes, tc) pour une cellule
+        self.rects = rects if rects is not None else []
+        self.rect = rect
+        self.framed = framed
+        self.cell = cell
         self.paras = txBody.findall(A + "p")
-        self.seg_index = {}         # index du paragraphe -> index du segment
-        self.merged = set()         # paragraphes fusionnes dans le precedent
-
+        self.seg_index = {}
+        self.merged = set()
 
 def _insets(body):
     if body.kind == "cell":
         tc = body.cell[3].find(A + "tcPr")
-
         def get(k, d):
             return (int(tc.get(k)) if tc is not None and tc.get(k) else d) / EMU_PER_PT
         return get("marL", 91440), get("marR", 91440), get("marT", 45720), get("marB", 45720)
@@ -486,7 +428,6 @@ def _insets(body):
     def g(k, d):
         return int(body.chain.body_attr(k, d)) / EMU_PER_PT
     return g("lIns", 91440), g("rIns", 91440), g("tIns", 45720), g("bIns", 45720)
-
 
 class Inventory:
     def __init__(self, prs):
@@ -518,7 +459,7 @@ class Inventory:
                 ph_type = None
             title = ph_type in _TITLE_TYPES
             base = shape
-            for _ in range(2):      # disposition puis masque
+            for _ in range(2):
                 try:
                     base = base._base_placeholder
                 except Exception:
@@ -538,8 +479,6 @@ class Inventory:
         return Chain(lst, bodies, self.theme(master), title)
 
     def walk_shapes(self, shapes, master, where, xf=(0, 0, 0, 0, 1.0, 1.0), rects=None):
-        """Parcourt les formes ; xf convertit les coordonnees d'un groupe en
-        coordonnees de la diapositive : (ox, oy, chx, chy, sx, sy) en EMU."""
         rects = rects if rects is not None else []
         ox, oy, chx, chy, sx, sy = xf
         for shape in shapes:
@@ -624,7 +563,6 @@ class Inventory:
             self.walk_shapes(master.shapes, master, "masque")
             for lay in master.slide_layouts:
                 self.walk_shapes(lay.shapes, master, "disposition")
-        # Graphiques et SmartArt : texte sans cadre mesurable.
         for part in prs.part.package.iter_parts():
             ct = part.content_type
             if ct.endswith("drawingml.chart+xml") and hasattr(part, "_element"):
@@ -638,16 +576,11 @@ class Inventory:
                     continue
                 self.blob_parts.append((part, root))
                 for el in root.iter():
-                    if (el.tag.endswith("}t") or el.tag.endswith("}txBody")) \
-                            and el.find(A + "p") is not None:
+                    if (el.tag.endswith("}t") or el.tag.endswith("}txBody")) and el.find(A + "p") is not None:
                         self.bodies.append(Body(el, Chain([], [], None), kind="smartart",
                                                 context="SmartArt"))
 
-
 def _is_framed(el):
-    """La forme a-t-elle un fond ou une bordure visibles ? Une zone de texte
-    sans fond ni bordure peut laisser son texte deborder dans le vide ;
-    un cadre visible doit le contenir."""
     tag = el.tag.split("}")[-1]
     if tag in ("pic", "graphicFrame"):
         return True
@@ -677,11 +610,7 @@ def _is_framed(el):
         line = True
     return fill or line
 
-
 def _free_space(body):
-    """Place libre (pts) sous et au-dessus de la forme, jusqu'a la forme
-    suivante qui la chevauche horizontalement, au bord du cadre qui la
-    contient, ou au bord de la diapositive."""
     if body.rect is None:
         return 0.0, 0.0
     x0, y0, x1, y1 = body.rect
@@ -693,9 +622,8 @@ def _free_space(body):
         if rr is None or r["el"] is own:
             continue
         if min(x1, rr[2]) - max(x0, rr[0]) <= 2.0:
-            continue        # pas de recouvrement horizontal
+            continue
         if rr[0] <= x0 + 1 and rr[2] >= x1 - 1 and rr[1] <= y0 + 1 and rr[3] >= y1 - 1:
-            # cadre qui contient la forme : on reste dedans
             below = min(below, rr[3] - y1 - 3.0)
             above = min(above, y0 - rr[1] - 3.0)
         elif rr[1] >= y1 - 1:
@@ -703,17 +631,13 @@ def _free_space(body):
         elif rr[3] <= y0 + 1:
             above = min(above, y0 - rr[3] - 2.0)
         else:
-            # forme qui empiete sur la zone : pas de marge de ce cote
             if rr[1] > y0:
                 below = min(below, 0.0)
             if rr[3] < y1:
                 above = min(above, 0.0)
     return max(0.0, below), max(0.0, above)
 
-
 def _extra_room(body):
-    """Hauteur supplementaire que le texte peut occuper hors de sa forme
-    sans gener : 0 pour un cadre visible ou une cellule."""
     if body.kind != "shape" or body.framed:
         return 0.0
     below, above = _free_space(body)
@@ -724,9 +648,7 @@ def _extra_room(body):
         return 2 * min(below, above)
     return below
 
-
 def chart_value_segments(prs):
-    """<c:v> des caches de chaines des graphiques (series, categories)."""
     out = []
     for part in prs.part.package.iter_parts():
         if not part.content_type.endswith("drawingml.chart+xml") or not hasattr(part, "_element"):
@@ -740,40 +662,25 @@ def chart_value_segments(prs):
                     out.append(seg)
     return out
 
-
 # --------------------------------------------------------------------------
 # Ajustement
 # --------------------------------------------------------------------------
 
-# Marge de securite sur la largeur pour la traduction : la mesure n'est
-# pas au pixel pres, et une ligne pile a la limite peut passer a la ligne
-# chez PowerPoint.
 WIDTH_SAFETY = 0.985
 
-
 def _body_layout(body, para_runs, scale, width_factor=1.0):
-    """Hauteur et largeur occupees par le corps pour des runs donnes, et
-    place disponible (largeur, hauteur, retour a la ligne)."""
     paras = [measure_paragraph(body.chain, p, runs) for p, runs in zip(body.paras, para_runs)
              if runs is not None]
     l, r, t, b = _insets(body)
-    # Dans un tableau, PowerPoint revient toujours a la ligne, meme avec
-    # wrap="none" dans le XML.
     wrap = body.kind == "cell" or body.chain.body_attr("wrap", "square") != "none"
     width = (body.width or 0) - l - r
     h, lines, w = layout(paras, width * width_factor, scale, 0.0, wrap)
     return h, w, lines, (width, (body.height or 0) - t - b, wrap)
 
-
 def _vertical(body):
     return body.chain.body_attr("vert", "horz") not in (None, "horz")
 
-
 def needed_scale(body, orig_runs, new_runs, start_scale, extra=0.0):
-    """Echelle (<= start_scale) a laquelle la traduction tient dans la
-    place disponible : la forme, ou ce qu'occupait deja l'original, plus
-    `extra` points de place libre autour. None si meme MIN_SCALE ne
-    suffit pas."""
     h_o, w_o, _, (avail_w, avail_h, wrap) = _body_layout(body, orig_runs, start_scale)
     limit_h = max(avail_h + extra, h_o) + 0.5
     limit_w = max(avail_w, w_o) + 0.5
@@ -785,20 +692,14 @@ def needed_scale(body, orig_runs, new_runs, start_scale, extra=0.0):
         s = round(s - SCALE_STEP, 4)
     return None
 
-
 def overflow_at(body, orig_runs, new_runs, scale):
-    """Points de hauteur qui manquent a la traduction a cette echelle."""
     h_o, _, _, (_, avail_h, _) = _body_layout(body, orig_runs, scale)
     h, _, _, _ = _body_layout(body, new_runs, scale, WIDTH_SAFETY)
     return max(0.0, h - max(avail_h, h_o) - 0.5)
 
-
 def apply_scale(body, scale):
-    """Reduit la taille du texte de tout le corps d'un facteur `scale`."""
     own_bp = body.txBody.find(A + "bodyPr")
     if body.kind == "shape" and own_bp is not None and own_bp.find(A + "normAutofit") is not None:
-        # Deja en "reduire le texte si necessaire" : PowerPoint applique
-        # fontScale a tout le corps.
         own_bp.find(A + "normAutofit").set("fontScale", str(int(round(scale * 100000))))
         return
     for p in body.paras:
@@ -818,15 +719,10 @@ def apply_scale(body, scale):
             new = _round_size(size * scale)
             rpr.set("sz", str(int(round(new * 100))))
 
-
 def _round_size(size):
-    """Demi-point inferieur : arrondir vers le haut ferait deborder."""
     return max(1.0, math.floor(size * 2 + 1e-6) / 2)
 
-
 def _runs_for(body, segments, results, orig):
-    """Runs a mesurer par paragraphe ; None pour un paragraphe fusionne
-    dans le precedent (il disparait a l'ecriture)."""
     out = []
     for pi in range(len(body.paras)):
         i = body.seg_index.get(pi)
@@ -838,13 +734,11 @@ def _runs_for(body, segments, results, orig):
             out.append(orig[pi])
     return out
 
-
 def _owner_translated(body, pi, results):
     k = pi
     while k >= 0 and k not in body.seg_index:
         k -= 1
     return k >= 0 and results[body.seg_index[k]] is not None
-
 
 # --------------------------------------------------------------------------
 # Fonction principale
@@ -856,8 +750,6 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    # Dossier de travail propre a cet appel : deux traductions simultanees
-    # d'un fichier du meme nom ne doivent pas partager leurs copies.
     work = tempfile.mkdtemp(prefix="traduction_")
     ext = os.path.splitext(input_path)[1]
     tmp_in = os.path.join(work, "in" + ext)
@@ -871,7 +763,6 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
     inv = Inventory(prs)
     inv.collect()
 
-    # Un segment par paragraphe contenant du texte.
     segments, contexts, owners = [], [], []
     for b in inv.bodies:
         pi = 0
@@ -891,18 +782,26 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
                 contexts.append(b.context)
                 owners.append(b)
             pi = group[-1] + 1
+            
     n_para = len(segments)
     chart_values = chart_value_segments(prs)
     segments += chart_values
     contexts += ["libellé de graphique"] * len(chart_values)
 
-    # Texte d'origine, releve AVANT toute ecriture, pour la mesure.
     orig = {id(b): [original_runs(p) for p in b.paras] for b in inv.bodies}
 
-    results, stats = translate_segments(segments, direction, "pptx", glossary_df,
-                                        progress_callback, contexts)
+    # Échelonnement : les lots de traduction couvrent les 70 premiers pourcents
+    def batch_progress(cur, tot):
+        if progress_callback:
+            p = int((cur / tot) * 70)
+            progress_callback(p, 100, f"Traduction par l'IA : lot {cur}/{tot}...")
 
-    # Mesure : a quelle echelle chaque corps traduit tient-il ?
+    results, stats = translate_segments(segments, direction, "pptx", glossary_df,
+                                        batch_progress, contexts)
+
+    if progress_callback:
+        progress_callback(72, 100, "📐 Analyse géométrique de la mise en page...")
+
     report = {"shrunk": 0, "grown": 0, "shortened": 0, "overflow": 0, "table_grown": 0}
     plans = {}
     for b in inv.bodies:
@@ -923,9 +822,6 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
             continue
         plans[id(b)] = [b, start, s, extra]
 
-    # Tableaux : PowerPoint agrandit les lignes trop pleines. Si la place
-    # est libre sous le tableau, on le laisse grandir plutot que de reduire
-    # le texte.
     by_table = {}
     for plan in plans.values():
         if plan[0].kind == "cell":
@@ -938,7 +834,6 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
             new_runs = _runs_for(b, segments, results, orig[id(b)])
             row = b.cell[0]
             grow[row] = max(grow.get(row, 0.0), overflow_at(b, orig[id(b)], new_runs, start))
-            # Lignes deja plus hautes que prevu dans l'original.
             h_o, _, _, (_, avail_h, _) = _body_layout(b, orig[id(b)], start)
             grown_before[row] = max(grown_before.get(row, 0.0), h_o - avail_h)
         below, _ = _free_space(cell_plans[0][0])
@@ -947,7 +842,6 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
                 pl[2] = pl[1]
             report["table_grown"] += 1
 
-    # Versions courtes pour ce qui devrait etre trop reduit.
     to_shorten = []
     for b, start, s, extra in plans.values():
         if s is not None and s >= start * SHORTEN_BELOW:
@@ -960,8 +854,10 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
             plain = re.sub(r"<[^>]+>", "", txt)
             if len(plain) > 12:
                 to_shorten.append((i, segments[i], txt, max(6, int(len(plain) * ratio * ratio))))
+                
     if to_shorten:
-        print(f"✂️ {len(to_shorten)} textes trop longs pour leur cadre : demande de versions courtes")
+        if progress_callback:
+            progress_callback(78, 100, f"✂️ Raccourcissement IA de {len(to_shorten)} textes trop longs...")
         for k in range(0, len(to_shorten), 40):
             short, i_tok, o_tok = shorten_segments(to_shorten[k:k + 40], direction)
             stats["input_tokens"] += i_tok
@@ -975,14 +871,15 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
                 results[i] = items
                 s2 = needed_scale(b, orig[id(b)], _runs_for(b, segments, results, orig[id(b)]),
                                   plan[1], plan[3])
-                # La version courte n'est gardee que si elle tient mieux.
                 if (s2 or 0) + 1e-9 > (plan[2] or 0):
                     plan[2] = s2
                     report["shortened"] += 1
                 else:
                     results[i] = old
 
-    # Ecriture du texte.
+    if progress_callback:
+        progress_callback(88, 100, "✍️ Réécriture des formes et styles XML...")
+
     for seg, items in zip(segments[:n_para], results[:n_para]):
         if items is not None:
             rebuild_paragraph(seg, items, tgt_lang)
@@ -992,14 +889,11 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
     for part, root in inv.blob_parts:
         part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
-    # Ajustement des cadres qui ne tiennent plus.
     for b, start, s, extra in plans.values():
         if s is not None and s >= start - 1e-9:
             continue
         kind, _ = b.chain.autofit()
         if b.kind == "shape" and kind == "spAutoFit":
-            # Forme "ajuster a la taille du texte" : PowerPoint l'agrandirait.
-            # On le fait si la place est libre en dessous.
             h_new, _, _, (_, avail_h, _) = _body_layout(
                 b, _runs_for(b, segments, results, orig[id(b)]), start, WIDTH_SAFETY)
             need = h_new - avail_h + 1.0
@@ -1018,9 +912,15 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
             apply_scale(b, final / start)
         report["shrunk"] += 1
 
+    if progress_callback:
+        progress_callback(96, 100, "💾 Enregistrement du fichier PowerPoint final...")
+
     prs.save(tmp_out)
     shutil.copy(tmp_out, output_path)
     shutil.rmtree(work, ignore_errors=True)
+
+    if progress_callback:
+        progress_callback(100, 100, "✅ Traduction finalisée !")
 
     print(f"📐 Ajustement : {report['shrunk']} cadres réduits, {report['grown']} agrandis, "
           f"{report['table_grown']} tableaux agrandis, "

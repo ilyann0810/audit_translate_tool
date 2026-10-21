@@ -1,23 +1,5 @@
 """
 Traduction DOCX en gardant la forme et le style.
-
-Chaque paragraphe (corps, tableaux, zones de texte, en-tetes, pieds de
-page, notes, commentaires) devient un segment balise (core/segments.py) :
-
-  - les runs de meme apparence sont regroupes ; chaque groupe garde son
-    rPr COMPLET (couleur, surlignage, taille, police, style de caractere),
-    recopie tel quel sur le texte traduit ;
-  - ce qui n'est pas du texte reste en place sous forme d'objet : images,
-    zones de texte, champs (instruction de champ, TOC, numero de page),
-    renvois de notes et de commentaires, symboles, texte supprime en mode
-    revision, formules ;
-  - les liens hypertexte et les insertions en mode revision restent des
-    conteneurs : le texte traduit est remis dedans ;
-  - les signets places en debut ou en fin de paragraphe y restent.
-
-Les paragraphes imbriques (zone de texte dans un paragraphe) sont des
-segments a part : l'objet qui les contient est deplace, jamais recopie,
-ce qui garde leur traduction.
 """
 import copy
 import os
@@ -41,25 +23,19 @@ XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 LOCALE = {"fr": "fr-FR", "de": "de-DE"}
 
-# Parties a traduire (fin du type de contenu).
 _TEXT_PARTS = ("document.main+xml", "header+xml", "footer+xml", "footnotes+xml",
                "endnotes+xml", "comments+xml")
 
-# Conteneurs dont le contenu est du texte du paragraphe.
 _CONTAINERS = {W + "hyperlink", W + "ins", W + "moveTo", W + "smartTag", W + "customXml"}
 
-# Marqueurs sans largeur.
 _MARKERS = {W + "bookmarkStart", W + "bookmarkEnd", W + "commentRangeStart",
             W + "commentRangeEnd", W + "permStart", W + "permEnd",
             W + "moveFromRangeStart", W + "moveFromRangeEnd", W + "moveToRangeStart",
             W + "moveToRangeEnd"}
 
-# Contenu de run qui n'est pas du texte a traduire.
 _RUN_TEXT = {W + "t"}
 _RUN_DROP = {W + "lastRenderedPageBreak"}
-
 _NEUTRAL_RPR = {W + "lang", W + "noProof", W + "rtl"}
-
 
 def _style_key(rpr):
     if rpr is None:
@@ -72,10 +48,7 @@ def _style_key(rpr):
         del el.attrib[a]
     return etree.tostring(el, encoding="unicode")
 
-
 class _Builder:
-    """Construit le segment d'un paragraphe en parcourant son contenu."""
-
     def __init__(self, p):
         self.seg = Segment()
         self.seg.meta["p"] = p
@@ -83,11 +56,9 @@ class _Builder:
         self.pending_markers = []
         self.pending_objects = []
         self.seen_text = False
-        self.in_field = False       # entre fldChar begin et separate
+        self.in_field = False
 
     def _flush_objects(self):
-        # Les objets consecutifs forment un seul objet, sauf s'ils ne sont
-        # pas dans le meme conteneur (lien, insertion...).
         group, chain = [], None
         for el, ch in self.pending_objects:
             if group and ch != chain:
@@ -132,13 +103,11 @@ class _Builder:
         if kind == "br":
             self.seg.meta.setdefault("br", el)
         self.seg.add_break(kind)
-        # le style du retour suit le texte voisin
         self.seg.meta.setdefault("break_rpr", rpr)
 
     def run(self, r, containers):
         rpr = r.find(W + "rPr")
         children = [c for c in r if c.tag != W + "rPr"]
-        # Run de champ ou d'objet pur : on garde le run d'origine entier.
         simple_obj = all(c.tag not in _RUN_TEXT and c.tag not in (W + "tab", W + "br", W + "cr")
                          for c in children)
         has_fld = any(c.tag in (W + "fldChar", W + "instrText") for c in children)
@@ -150,7 +119,6 @@ class _Builder:
                 elif t in ("separate", "end"):
                     self.in_field = False
         if self.in_field and not has_fld:
-            # Instruction de champ sur plusieurs runs : objet.
             self.object(r, containers)
             return
         if simple_obj or has_fld:
@@ -178,8 +146,6 @@ class _Builder:
 
     @staticmethod
     def _wrap(child, rpr):
-        # Le run d'emballage n'est cree qu'a l'ecriture : l'extraction ne
-        # doit rien modifier, un paragraphe peut rester tel quel.
         return ("wrap", child, rpr)
 
     def walk(self, parent, containers=()):
@@ -193,8 +159,7 @@ class _Builder:
                 self.walk(child, containers + (child,))
             elif tag == W + "sdt":
                 content = child.find(W + "sdtContent")
-                if content is not None and content.find(W + "r") is not None \
-                        and content.find(W + "p") is None:
+                if content is not None and content.find(W + "r") is not None and content.find(W + "p") is None:
                     self.walk(content, containers + (child,))
                 else:
                     self.object(child, containers)
@@ -212,16 +177,13 @@ class _Builder:
         self.seg.meta["trail"] = self.trail
         return self.seg
 
-
 def paragraph_segment(p):
     b = _Builder(p)
     b.walk(p)
     seg = b.finish()
     return seg if seg.has_text() else None
 
-
 def _shell(container):
-    """Copie vide d'un conteneur (lien, insertion, controle de contenu)."""
     sh = etree.Element(container.tag, attrib=dict(container.attrib), nsmap=container.nsmap)
     if container.tag == W + "sdt":
         for c in container:
@@ -230,10 +192,8 @@ def _shell(container):
         etree.SubElement(sh, W + "sdtContent")
     return sh
 
-
 def _inner(shell):
     return shell.find(W + "sdtContent") if shell.tag == W + "sdt" else shell
-
 
 def rebuild_paragraph(seg, items, target_lang):
     p = seg.meta["p"]
@@ -243,8 +203,7 @@ def rebuild_paragraph(seg, items, target_lang):
             p.remove(child)
     locale = LOCALE.get(target_lang)
 
-    # Chaque element a inserer, avec la chaine de conteneurs ou le placer.
-    out = []        # (element, conteneurs)
+    out = []
 
     def make_run(rpr, *contents):
         r = etree.Element(W + "r")
@@ -290,15 +249,13 @@ def rebuild_paragraph(seg, items, target_lang):
                     r = etree.Element(W + "r")
                     if rpr is not None:
                         r.append(copy.deepcopy(rpr))
-                    r.append(child)     # deplace, pas de copie : garde l'identite
+                    r.append(child)
                     el = r
                 out.append((el, chain))
 
     for el in seg.meta.get("lead", []):
         p.append(el)
-    # Regroupement des runs consecutifs d'un meme conteneur. Deux liens
-    # identiques (meme cible) se suivant forment un seul lien : l'ordre des
-    # mots de la traduction peut avoir separe les morceaux d'un meme lien.
+
     def sig(chain):
         return tuple((c.tag, tuple(sorted(c.attrib.items()))) for c in chain)
 
@@ -323,7 +280,6 @@ def rebuild_paragraph(seg, items, target_lang):
     for el in seg.meta.get("trail", []):
         p.append(el)
 
-
 def _context(p, part_kind):
     if part_kind != "corps":
         return part_kind
@@ -341,14 +297,11 @@ def _context(p, part_kind):
         return "titre"
     return "paragraphe"
 
-
 _PART_KIND = {"document.main+xml": "corps", "header+xml": "en-tête", "footer+xml": "pied de page",
               "footnotes+xml": "note de bas de page", "endnotes+xml": "note de fin",
               "comments+xml": "commentaire"}
 
-
 def _set_default_language(doc, src_lang, tgt_lang):
-    """Langue de verification : celle de la traduction, dans les styles."""
     try:
         root = doc.styles.element
     except Exception:
@@ -359,16 +312,13 @@ def _set_default_language(doc, src_lang, tgt_lang):
         if v and v.lower().startswith(src_lang) and loc:
             lang.set(W + "val", loc)
 
-
 def translate_docx_universal(input_path: str, output_path: str, glossary_path: str = None,
                              progress_callback=None, direction="Allemand ➔ Français"):
-    """Fonction principale appelée par le routeur Streamlit."""
     start_time = time.time()
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    # Dossier de travail propre a cet appel : deux traductions simultanees
-    # d'un fichier du meme nom ne doivent pas partager leurs copies.
+
     work = tempfile.mkdtemp(prefix="traduction_")
     ext = os.path.splitext(input_path)[1]
     tmp_in = os.path.join(work, "in" + ext)
@@ -397,7 +347,6 @@ def translate_docx_universal(input_path: str, output_path: str, glossary_path: s
                 continue
             blob_parts.append((part, root))
         if is_chart:
-            # Graphique : paragraphes DrawingML (titres) et caches de libelles.
             from processors.pptx_processor import paragraph_segment as dml_segment
             for p in root.iter(A + "p"):
                 seg = dml_segment(p)
@@ -413,21 +362,25 @@ def translate_docx_universal(input_path: str, output_path: str, glossary_path: s
                     seg.meta["v"] = v
                     chart_values.append(seg)
             continue
-        # Liste figee avant toute modification (les zones de texte sont des
-        # paragraphes imbriques dans d'autres).
+
         for p in list(root.iter(W + "p")):
             seg = paragraph_segment(p)
             if seg is not None:
                 segments.append(seg)
                 contexts.append(_context(p, kind))
-        # Formes DrawingML (zones de texte "wps") : texte en w:p deja couvert.
+
     n_main = len(segments)
     segments += chart_values
     contexts += ["libellé de graphique"] * len(chart_values)
 
     print(f"⚡ Traitement DOCX de {len(segments)} paragraphes...")
+
+    # Le suivi global est délégué directement à translate_segments (lots + retries)
     results, stats = translate_segments(segments, direction, "docx", glossary_df,
                                         progress_callback, contexts)
+
+    if progress_callback:
+        progress_callback(85, 100, "✍️ Réécriture des paragraphes et styles XML Word...")
 
     from processors.pptx_processor import rebuild_paragraph as dml_rebuild
     for seg, items in zip(segments[:n_main], results[:n_main]):
@@ -437,16 +390,25 @@ def translate_docx_universal(input_path: str, output_path: str, glossary_path: s
             dml_rebuild(seg, items, tgt_lang)
         else:
             rebuild_paragraph(seg, items, tgt_lang)
+
     for seg, items in zip(segments[n_main:], results[n_main:]):
         if items is not None:
             seg.meta["v"].text = "".join(it[2] for it in items if it[0] == "t")
+
     for part, root in blob_parts:
         part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
     _set_default_language(doc, src_lang, tgt_lang)
+
+    if progress_callback:
+        progress_callback(95, 100, "💾 Enregistrement du document Word final...")
 
     doc.save(tmp_out)
     shutil.copy(tmp_out, output_path)
     shutil.rmtree(work, ignore_errors=True)
+
+    if progress_callback:
+        progress_callback(100, 100, "✅ Traduction finalisée !")
 
     print(f"🔤 Segments : {stats['segments']}, envoyés : {stats['segments'] - stats['skipped']}, "
           f"redemandés : {stats['retried']}, sans styles locaux : {stats['fallback']}")
