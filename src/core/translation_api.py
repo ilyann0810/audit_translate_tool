@@ -131,7 +131,7 @@ LANG = {
 PRICE_IN, PRICE_OUT = 0.30, 2.50
 BATCH_CHARS = 6000
 BATCH_MAX_SEGMENTS = 60
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 
 _RETRY_MARKERS = ("429", "resource exhausted", "resource_exhausted", "503", "unavailable",
                   "500", "internal", "deadline", "timeout", "temporarily")
@@ -144,6 +144,18 @@ def _is_transient(exc):
     t = str(exc).lower()
     return any(m in t for m in _RETRY_MARKERS)
 
+def _json_config():
+    """Reponse JSON, sans reflexion (thinking) : gemini-2.5-flash reflechit par
+    defaut, ce qui double la duree et le cout de chaque appel sans ameliorer
+    la traduction. Si le SDK installe ne connait pas thinking_config, on garde
+    la configuration simple."""
+    try:
+        return GenerationConfig.from_dict({"temperature": 0.1,
+                                           "response_mime_type": "application/json",
+                                           "thinking_config": {"thinking_budget": 0}})
+    except Exception:
+        return GenerationConfig(temperature=0.1, response_mime_type="application/json")
+
 def generate_json(prompt, kind="segments"):
     cached = _cache_get(kind, prompt)
     if cached is not None:
@@ -151,7 +163,7 @@ def generate_json(prompt, kind="segments"):
             return json.loads(cached["text"]), 0, 0
         except ValueError:
             pass
-    config = GenerationConfig(temperature=0.1, response_mime_type="application/json")
+    config = _json_config()
     in_tok = out_tok = 0
     for attempt in range(MAX_RETRIES):
         try:
@@ -159,7 +171,9 @@ def generate_json(prompt, kind="segments"):
                 prompt, generation_config=config, safety_settings=DEFAULT_SAFETY_SETTINGS)
             um = getattr(response, "usage_metadata", None)
             in_tok += getattr(um, "prompt_token_count", 0) or 0
-            out_tok += getattr(um, "candidates_token_count", 0) or 0
+            # La reflexion est facturee comme de la sortie.
+            out_tok += (getattr(um, "candidates_token_count", 0) or 0) \
+                + (getattr(um, "thoughts_token_count", 0) or 0)
             if not response.candidates or not response.candidates[0].content.parts:
                 return None, in_tok, out_tok
             text = response.text
@@ -250,7 +264,13 @@ def _not_translated(src, dst, direction):
     s_lang, t_lang = LANG[direction][:2]
     plain = lambda t: re.sub(r"<[^>]+>", " ", t)
     a, b = _lang_scores(plain(src)), _lang_scores(plain(dst))
-    return a[s_lang] >= 4.0 and b[s_lang] >= 0.5 * a[s_lang] and b[s_lang] > b[t_lang]
+    if a[s_lang] >= 4.0 and b[s_lang] >= 0.5 * a[s_lang] and b[s_lang] > b[t_lang]:
+        return True
+    # Libelle court recopie tel quel alors qu'il est nettement dans la langue
+    # source (« NAT Konzept zur O+G-Rettertüte ») : le seuil ci-dessus ne voit
+    # pas les textes courts.
+    return (" ".join(plain(dst).split()) == " ".join(plain(src).split())
+            and a[s_lang] >= 1.5 and a[s_lang] > a[t_lang])
 
 def _looks_chatty(src, dst):
     low = dst.lower()
@@ -327,6 +347,9 @@ def translate_segments(segments, direction, kind, glossary_df=None,
             _safe_progress(progress_callback, pct, 100, f"Traduction par l'IA : lot {done[0]}/{max(1, len(batches))}...")
 
     if batches:
+        # Message immediat : la barre ne bouge qu'au retour du premier lot.
+        _safe_progress(progress_callback, 1, 100,
+                       f"🤖 Traduction par l'IA : {len(batches)} lot(s) envoyé(s)...")
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(batches))) as ex:
             list(ex.map(run_top, batches))
 

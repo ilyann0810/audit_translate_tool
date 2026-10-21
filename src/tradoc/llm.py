@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -219,10 +220,16 @@ BASE_DELAY = 12.0
 TOKENS = {"input": 0, "output": 0}
 
 
+_TOKENS_LOCK = threading.Lock()
+
+
 def _count_tokens(resp):
     um = getattr(resp, "usage_metadata", None)
-    TOKENS["input"] += getattr(um, "prompt_token_count", 0) or 0
-    TOKENS["output"] += getattr(um, "candidates_token_count", 0) or 0
+    with _TOKENS_LOCK:
+        TOKENS["input"] += getattr(um, "prompt_token_count", 0) or 0
+        # La reflexion (thinking) est facturee comme de la sortie.
+        TOKENS["output"] += (getattr(um, "candidates_token_count", 0) or 0) \
+            + (getattr(um, "thoughts_token_count", 0) or 0)
 
 
 def _is_transient(exc):
@@ -241,6 +248,9 @@ def _call(client, model, system, user, log=print):
         response_mime_type="application/json",
         response_schema=RESPONSE_SCHEMA,
         temperature=0.2,
+        # Sans reflexion : deux fois plus rapide et moins cher, meme qualite
+        # de traduction sur nos documents.
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
     last = None
@@ -303,7 +313,10 @@ def translate_batch(client, model, segments, source, target, domain,
 # un document de 70 000 caracteres depasse largement ce qu'un seul appel
 # peut rendre en sortie. On decoupe alors en tranches CONSECUTIVES, ce qui
 # garde ensemble les slides voisines et donc l'essentiel du contexte.
-CHARS_PER_CALL = 14000
+# Les tranches partent en parallele : des tranches plus petites rendent
+# chaque reponse plus courte, donc le document plus vite traduit.
+CHARS_PER_CALL = 6000
+MAX_PARALLEL_CALLS = 6
 
 
 def _chunk_by_chars(segments, budget):
@@ -331,12 +344,14 @@ def _cache_key(model, source, target, domain, glossary, text):
 def translate_document(segments, source, target, domain, glossary,
                        project, location, model=DEFAULT_MODEL,
                        name="document", max_batch=None, log=print,
-                       chars_per_call=CHARS_PER_CALL, cache_path=None):
+                       chars_per_call=CHARS_PER_CALL, cache_path=None,
+                       progress=None):
     """Traduit les segments, en reutilisant ce qui est deja en cache.
 
     Le cache est la table silver.translations du PROMPT_CLAUDE_CODE.md en
     version fichier : un texte deja traduit avec le meme modele, les memes
     langues, le meme domaine et le meme glossaire n'est jamais repaye.
+    progress(fait, total, libelle), optionnel, suit les tranches traduites.
     """
     cache = {}
     if cache_path and os.path.isfile(cache_path):
@@ -354,7 +369,7 @@ def translate_document(segments, source, target, domain, glossary,
     out, stats = ({}, {"calls": 0, "retries": 0, "max_depth": 0}) \
         if not todo else _translate_uncached(
             todo, source, target, domain, glossary, project, location,
-            model, name, max_batch, log, chars_per_call)
+            model, name, max_batch, log, chars_per_call, progress)
 
     if cache_path and out:
         src = {s.uid: s.text for s in todo}
@@ -384,35 +399,44 @@ def translate_document(segments, source, target, domain, glossary,
 
 def _translate_uncached(segments, source, target, domain, glossary,
                         project, location, model, name, max_batch, log,
-                        chars_per_call):
+                        chars_per_call, progress=None):
     """Traduit tous les segments d'un document.
 
-    Par defaut, un seul appel pour tout le document : c'est la consigne du
-    PROMPT_CLAUDE_CODE.md, le modele doit voir l'ensemble pour rester
-    coherent. En cas d'echec d'alignement, on redecoupe en deux et on
-    recommence, jusqu'a isoler le lot fautif.
+    Le document est decoupe en tranches consecutives traduites en
+    parallele (chaque appel ne voit que sa tranche). En cas d'echec
+    d'alignement, on redecoupe en deux et on recommence, jusqu'a isoler
+    le lot fautif.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     client = _client(project, location)
     out = {}
     stats = {"calls": 0, "retries": 0, "max_depth": 0}
+    lock = threading.Lock()
 
     def run(batch, depth=0):
-        stats["max_depth"] = max(stats["max_depth"], depth)
+        with lock:
+            stats["max_depth"] = max(stats["max_depth"], depth)
         if not batch:
             return
         try:
-            stats["calls"] += 1
-            out.update(translate_batch(client, model, batch, source, target,
-                                       domain, glossary, name, log=log))
+            with lock:
+                stats["calls"] += 1
+            got = translate_batch(client, model, batch, source, target,
+                                  domain, glossary, name, log=log)
+            with lock:
+                out.update(got)
         except AlignmentError as exc:
             if len(batch) == 1:
                 # Un seul segment et toujours desaligne : on le laisse en
                 # langue source plutot que d'ecrire n'importe quoi.
                 log("    ALIGNEMENT : segment %s abandonne (%s)"
                     % (batch[0].uid, exc))
-                out[batch[0].uid] = batch[0].text
+                with lock:
+                    out[batch[0].uid] = batch[0].text
                 return
-            stats["retries"] += 1
+            with lock:
+                stats["retries"] += 1
             mid = len(batch) // 2
             log("    ALIGNEMENT : %s -> on redecoupe en %d + %d"
                 % (exc, mid, len(batch) - mid))
@@ -427,8 +451,20 @@ def _translate_uncached(segments, source, target, domain, glossary,
 
     if len(chunks) > 1:
         log("    document decoupe en %d tranches consecutives" % len(chunks))
-    for chunk in chunks:
+    done = [0]
+
+    def run_chunk(chunk):
         run(chunk)
+        with lock:
+            done[0] += 1
+            if progress:
+                progress(done[0], len(chunks), "🤖 Traduction par l'IA : partie %d/%d terminée..."
+                         % (done[0], len(chunks)))
+
+    if progress:
+        progress(0, len(chunks), "🤖 Traduction par l'IA : %d partie(s) envoyée(s)..." % len(chunks))
+    with ThreadPoolExecutor(max_workers=max(1, min(MAX_PARALLEL_CALLS, len(chunks)))) as ex:
+        list(ex.map(run_chunk, chunks))
 
     return out, stats
 

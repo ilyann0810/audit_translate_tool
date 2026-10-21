@@ -37,59 +37,23 @@ def translate_pdf_universal(input_path: str, output_path: str, glossary_path: st
     print(f"🚀 Lancement du moteur tradoc ({DEFAULT_MODEL}) : {source_code} ➔ {target_code}")
     tradoc_llm.TOKENS["input"] = tradoc_llm.TOKENS["output"] = 0
 
-    # État partagé pour échelonner la progression de 0 à 100 %
-    progress_state = {"val": 5}
-    if progress_callback:
-        progress_callback(5, 100, "🚀 Initialisation et analyse du PDF...")
+    # Le moteur tradoc annonce lui-meme ses etapes (analyse, traduction par
+    # parties, ajustement, mise en page page par page) : on les relaie tel
+    # quel. Les messages techniques du journal restent dans la console, sauf
+    # l'attente sur quota, qui explique une pause a l'utilisateur.
+    last = {"pct": 0}
 
-    def smart_pdf_logger(msg):
-        """Intercepte les logs de tradoc pour actualiser la barre de progression Streamlit."""
+    def pdf_progress(pct, label):
+        last["pct"] = int(pct)
+        if progress_callback:
+            progress_callback(last["pct"], 100, label)
+
+    def pdf_logger(msg):
         print(msg)
-        if not progress_callback:
-            return
-
-        txt = str(msg).strip()
-        if not txt or txt == "-":
-            return
-
-        txt_lower = txt.lower()
-
-        # 1. Progression par page
-        m_page = re.search(r'page\s*(\d+)(?:\s*/\s*(\d+))?', txt, re.IGNORECASE)
-        if m_page:
-            cur = int(m_page.group(1))
-            tot = int(m_page.group(2)) if m_page.group(2) else 50
-            progress_state["val"] = min(70, 10 + int((cur / max(1, tot)) * 60))
-            progress_callback(progress_state["val"], 100, f"📄 Traduction du PDF (page {cur}/{tot})...")
-            return
-
-        # 2. Réparation et injection des polices
-        if "police" in txt_lower and "reparee" in txt_lower:
-            progress_state["val"] = min(78, max(progress_state["val"], 72))
-            progress_callback(progress_state["val"], 100, "🔧 Injection des caractères et polices vectorielles...")
-            return
-
-        # 3. Raccourcissement des blocs trop longs
-        if "trop serres" in txt_lower or "versions plus courtes" in txt_lower:
-            progress_state["val"] = 82
-            progress_callback(progress_state["val"], 100, f"✂️ {txt}")
-            return
-
-        if "blocs raccourcis" in txt_lower:
-            progress_state["val"] = 92
-            progress_callback(progress_state["val"], 100, f"✅ {txt}")
-            return
-
-        # 4. Finalisation
-        if "traduit avec succès" in txt_lower:
-            progress_state["val"] = 98
-            progress_callback(98, 100, "💾 Assemblage final du document PDF...")
-            return
-
-        # 5. Autres statuts textuels courts
-        if len(txt) < 70 and not txt.startswith("http"):
-            progress_state["val"] = min(95, progress_state["val"] + 1)
-            progress_callback(progress_state["val"], 100, txt)
+        m = re.search(r"QUOTA .* dans (\d+) s", str(msg))
+        if m and progress_callback:
+            progress_callback(last["pct"], 100,
+                              f"⏳ Limite de l'IA atteinte : nouvelle tentative dans {m.group(1)} s...")
 
     try:
         stats = translate_pdf(
@@ -102,9 +66,10 @@ def translate_pdf_universal(input_path: str, output_path: str, glossary_path: st
             project=get_project_id(),
             location=DEFAULT_LOCATION,
             model=DEFAULT_MODEL,
-            log=smart_pdf_logger,  # Utilisation du logger connecté à Streamlit
+            log=pdf_logger,
             cache_path=cache_file,
-            codes=(source_code, target_code)
+            codes=(source_code, target_code),
+            progress=pdf_progress,
         )
 
         if progress_callback:

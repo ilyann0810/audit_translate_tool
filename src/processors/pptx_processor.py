@@ -790,11 +790,12 @@ def translate_pptx_universal(input_path: str, output_path: str, glossary_path: s
 
     orig = {id(b): [original_runs(p) for p in b.paras] for b in inv.bodies}
 
-    # Échelonnement : les lots de traduction couvrent les 70 premiers pourcents
-    def batch_progress(cur, tot):
+    # Échelonnement : translate_segments annonce 0 à 80 % (lots puis contrôle
+    # qualité) avec son propre libellé ; ici la traduction couvre 0 à 70 %.
+    def batch_progress(cur, tot, msg=None):
         if progress_callback:
-            p = int((cur / tot) * 70)
-            progress_callback(p, 100, f"Traduction par l'IA : lot {cur}/{tot}...")
+            p = min(70, int((cur / max(1, tot)) * 100 * 70 / 80))
+            progress_callback(p, 100, msg or "Traduction par l'IA...")
 
     results, stats = translate_segments(segments, direction, "pptx", glossary_df,
                                         batch_progress, contexts)

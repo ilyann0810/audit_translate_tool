@@ -301,6 +301,8 @@ def translate_xlsx_universal(input_path: str, output_path: str, glossary_path: s
             seg.meta["v"].text = "".join(it[2] for it in items if it[0] == "t")
 
     # Ecriture : parties modifiees regenerees, le reste recopie tel quel.
+    if progress_callback:
+        progress_callback(90, 100, "💾 Enregistrement du classeur Excel final...")
     with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zout:
         for info in zin.infolist():
             if info.filename in roots:
@@ -313,6 +315,8 @@ def translate_xlsx_universal(input_path: str, output_path: str, glossary_path: s
 
     shutil.copy(tmp_out, output_path)
     shutil.rmtree(work, ignore_errors=True)
+    if progress_callback:
+        progress_callback(100, 100, "✅ Traduction finalisée !")
 
     print(f"🔤 Segments : {stats['segments']}, envoyés : {stats['segments'] - stats['skipped']}, "
           f"redemandés : {stats['retried']}, sans styles locaux : {stats['fallback']}, "

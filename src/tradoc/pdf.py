@@ -2293,7 +2293,7 @@ def _render_tilted(page, block, translated, fonts):
     return scale
 
 
-def rewrite(doc, blocks, translations, log=print, hyph=None):
+def rewrite(doc, blocks, translations, log=print, hyph=None, progress=None):
     stats = {"written": 0, "shrunk": 0, "overflow": [], "tag_fallback": 0,
              "recoloured": 0, "unchanged": 0, "issues": []}
     fonts = FontBook(doc)
@@ -2312,7 +2312,9 @@ def rewrite(doc, blocks, translations, log=print, hyph=None):
             continue
         by_page.setdefault(b.page, []).append(b)
 
-    for pno, items in sorted(by_page.items()):
+    for n, (pno, items) in enumerate(sorted(by_page.items())):
+        if progress:
+            progress(n, len(by_page), "🖋️ Mise en page : page %d/%d..." % (pno + 1, doc.page_count))
         page = doc[pno]
         before = page.get_drawings()
         hidden = _hidden_spans(page)
@@ -2418,7 +2420,7 @@ def enough_words(full, short):
 
 
 def tighten(doc, blocks, translations, target, project, location, model,
-            hyph=None, log=print):
+            hyph=None, log=print, progress=None):
     """Mesure chaque bloc traduit et fait raccourcir ceux qui ne tiennent pas.
 
     La consigne de longueur du prompt ne suffit pas : le modele ne voit pas
@@ -2428,6 +2430,10 @@ def tighten(doc, blocks, translations, target, project, location, model,
     caracteres, N etant deduit de la reduction mesuree. La version courte
     n'est gardee que si elle tient mieux.
     """
+    # Progression : mesure 0 a 60 %, raccourcissement 60 a 90 %, controle
+    # des versions courtes 90 a 100 %.
+    report = progress or (lambda done, total, label: None)
+    report(0, 100, "🔤 Préparation des polices...")
     fonts = FontBook(doc)
     scratch = fitz.open()
     pages = {}
@@ -2444,10 +2450,16 @@ def tighten(doc, blocks, translations, target, project, location, model,
         return scale if fits else scale * 0.5
 
     todo, scales = [], {}
+    last_page = None
     for b in blocks:
         new = translations.get(b.uid, "")
         if not new.strip() or _norm(new) == _norm(b.text) or b.angle:
             continue
+        if b.page != last_page:
+            last_page = b.page
+            report(60 * b.page, 100 * doc.page_count,
+                   "📏 Vérification de la place disponible : page %d/%d..."
+                   % (b.page + 1, doc.page_count))
         sc = measure(b, new)
         if sc < SHORTEN_BELOW and len(_norm(new)) > 6:
             limit = max(4, int(len(_norm(new)) * sc * 0.95))
@@ -2459,7 +2471,9 @@ def tighten(doc, blocks, translations, target, project, location, model,
 
     log("    %d blocs trop serres : demande de versions plus courtes"
         % len(todo))
+    report(60, 100, "✂️ Raccourcissement par l'IA de %d texte(s) trop long(s)..." % len(todo))
     short = shorten(todo, target, project, location, model, log=log)
+    report(90, 100, "📏 Contrôle des versions raccourcies...")
     by_uid = {b.uid: b for b in blocks}
     better = 0
     for uid, txt in short.items():
@@ -2491,14 +2505,24 @@ def _language_issues(blocks, translations, src_code, tgt_code):
 
 def translate_pdf(in_path, out_path, source, target, domain, glossary,
                   project, location="global", model=DEFAULT_MODEL,
-                  log=print, cache_path=None, codes=("de", "fr")):
+                  log=print, cache_path=None, codes=("de", "fr"), progress=None):
+    """progress(pourcentage, libelle), optionnel : avancement pour l'interface.
+    Les parts de chaque etape suivent leur duree mesuree sur nos documents."""
+    def stage(lo, hi):
+        def report(done, total, label):
+            if progress:
+                progress(lo + (hi - lo) * done / max(1, total), label)
+        return report
+
     doc = fitz.open(in_path)
+    stage(0, 1)(0, 1, "🔎 Analyse du PDF (%d pages)..." % doc.page_count)
     blocks = extract_blocks(doc)
     tagged = sum(1 for b in blocks if not b.uniform_style)
     unreadable = sum(1 for b in blocks if b.ocr)
     log("  %d blocs sur %d pages, dont %d a styles melanges, %d illisibles"
         % (len(blocks), doc.page_count, tagged, unreadable))
     if unreadable:
+        stage(8, 15)(0, 1, "👁️ Lecture par l'IA des textes illisibles (%d zones)..." % unreadable)
         blocks = split_unreadable_by_cells(doc, blocks)
         blocks = read_unreadable(doc, blocks, project, location, model, log)
     widen(doc, blocks)
@@ -2514,7 +2538,7 @@ def translate_pdf(in_path, out_path, source, target, domain, glossary,
     translations, call_stats = translate_document(
         blocks, source, target, domain, glossary, project, location,
         model, name=os.path.basename(in_path), log=log,
-        cache_path=cache_path)
+        cache_path=cache_path, progress=stage(15, 40))
 
     flagged = []
     for b in blocks:
@@ -2525,10 +2549,12 @@ def translate_pdf(in_path, out_path, source, target, domain, glossary,
                             "src": b.text, "dst": new})
 
     tighten(doc, blocks, translations, target, project, location, model,
-            hyph, log)
-    stats = rewrite(doc, blocks, translations, log=log, hyph=hyph)
+            hyph, log, progress=stage(40, 62))
+    stats = rewrite(doc, blocks, translations, log=log, hyph=hyph,
+                    progress=stage(62, 97))
     stats["issues"] = _language_issues(blocks, translations, *codes) \
         + stats["issues"]
+    stage(97, 100)(0, 1, "💾 Enregistrement du PDF...")
     try:
         doc.subset_fonts()
     except Exception:

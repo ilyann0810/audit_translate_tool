@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import tempfile
 import threading
+import time
 import traceback
 from core.router import process_translation
 
@@ -55,8 +56,17 @@ if uploaded_files and st.button("Lancer la traduction", type="primary"):
             output_name = f"{prefix}{uploaded_file.name}"
             output_path = os.path.join(temp_dir, output_name)
 
-            my_bar = st.progress(0, text="Connexion à l'IA...")
-            
+            my_bar = st.progress(0, text="Préparation du document...")
+            bar = {"pct": 0, "label": "Préparation du document...", "t0": time.time()}
+            bar_lock = threading.Lock()
+            stop_ticker = threading.Event()
+
+            def show_bar():
+                """Affiche l'étape en cours et le temps écoulé (appelé sous bar_lock)."""
+                s = int(time.time() - bar["t0"])
+                elapsed = f"{s // 60} min {s % 60:02d} s" if s >= 60 else f"{s} s"
+                my_bar.progress(bar["pct"], text=f"{bar['label']}  ·  ⏳ {elapsed}")
+
             def update_progress(current, total, status_text=None):
                 """Met à jour la barre avec prise en charge explicite du texte d'étape."""
                 if total <= 0:
@@ -64,18 +74,39 @@ if uploaded_files and st.button("Lancer la traduction", type="primary"):
                 if main_ctx is not None and add_script_run_ctx is not None:
                     add_script_run_ctx(threading.current_thread(), main_ctx)
                 percent = min(100, max(0, int((current / total) * 100)))
-                # Affiche le libellé transmis ou le libellé standard
-                label = status_text if status_text else f"Traduction par l'IA : lot {current}/{total}..."
-                my_bar.progress(percent, text=label)
+                with bar_lock:
+                    # Jamais de retour en arrière : les lots parallèles finissent dans le désordre.
+                    bar["pct"] = max(bar["pct"], percent)
+                    bar["label"] = status_text or "Traduction en cours..."
+                    show_bar()
+
+            def tick():
+                """Fait avancer le compteur de temps même pendant un long appel à l'IA,
+                pour que l'écran ne paraisse jamais figé."""
+                while not stop_ticker.wait(1.0):
+                    try:
+                        with bar_lock:
+                            show_bar()
+                    except Exception:
+                        return
+
+            ticker = threading.Thread(target=tick, daemon=True)
+            if main_ctx is not None and add_script_run_ctx is not None:
+                add_script_run_ctx(ticker, main_ctx)
+            ticker.start()
 
             try:
-                bilan = process_translation(
-                    input_path, 
-                    output_path, 
-                    glossary_path, 
-                    progress_callback=update_progress,
-                    direction=direction
-                )
+                try:
+                    bilan = process_translation(
+                        input_path,
+                        output_path,
+                        glossary_path,
+                        progress_callback=update_progress,
+                        direction=direction
+                    )
+                finally:
+                    stop_ticker.set()
+                    ticker.join()
 
                 my_bar.empty()
 
